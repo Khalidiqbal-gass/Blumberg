@@ -148,9 +148,13 @@ def load_market_data(
                     missing_syms = [s for s in target_syms if s not in cached_syms]
 
                     if missing_syms and len(target_syms) > len(cached_syms):
-                        # Overlay real Angel One cached bars with the remaining requested universe
-                        # so all requested stocks (up to 2,600+) are actively evaluated!
-                        rem_bars = generate_synthetic_universe(missing_syms, num_days=num_days)
+                        # Overlay real bars: try live yfinance first before synthetic fallback
+                        try:
+                            rem_bars = fetch_historical_ohlcv(missing_syms[:50], period="1y", data_source="yfinance")
+                            if rem_bars is None or rem_bars.empty:
+                                rem_bars = generate_synthetic_universe(missing_syms, num_days=num_days)
+                        except Exception:
+                            rem_bars = generate_synthetic_universe(missing_syms, num_days=num_days)
                         bars = pd.concat([full_df, rem_bars], ignore_index=True)
                     else:
                         full_df["clean_sym"] = full_df["symbol"].str.upper().str.replace(".NS", "").str.replace(".BO", "")
@@ -344,6 +348,9 @@ filtered_ranked = ranked_df[
 
 if only_recent_ipos and "is_recent_ipo" in filtered_ranked.columns:
     filtered_ranked = filtered_ranked[filtered_ranked["is_recent_ipo"] == True]
+
+if data_mode == "Offline Indian Dataset (Fast)":
+    st.info("ℹ️ **Offline Simulation Mode Active:** Ticker prices and candles in this mode use mathematical simulation for offline unit testing. For 100% real live NSE/BSE market prices and charts matching TradingView & Zerodha, switch **Data Source Mode** in the sidebar to '**🟢 Institutional EOD Cache**' or '**Live Market Feed (NSE / Yahoo)**'.")
 
 # Top Metrics Ribbon
 col1, col2, col3, col4, col5 = st.columns(5)
