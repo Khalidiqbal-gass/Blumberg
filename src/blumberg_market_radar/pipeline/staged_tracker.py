@@ -412,8 +412,12 @@ def update_pipeline_with_bars(
         peak_mfe = max((high_water / base_price - 1.0) * 100.0, r.peak_mfe_pct)
         worst_mae = min((low_water / base_price - 1.0) * 100.0, r.max_mae_pct)
 
-        # Growth-based layer and status assignment
-        current_layer, status = classify_layer_by_growth(
+        # Growth-based layer and status assignment (Terminal status preservation)
+        if any(k in r.status.upper() for k in ('STOP_LOSS', 'DROPPED')):
+            current_layer = r.current_layer
+            status = r.status
+        else:
+            current_layer, status = classify_layer_by_growth(
             days=n_sessions,
             current_gain_pct=current_gain,
             max_mae_pct=worst_mae,

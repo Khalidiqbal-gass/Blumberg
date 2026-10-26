@@ -1,0 +1,5 @@
+Exclusion_Scenario,Excluded_Symbols,CAGR_Pct,Max_Drawdown_Pct,Final_Capital_Rs,Multiple,Trades,Win_Rate_Pct
+Baseline (All 599 Trades),None,22.82,-28.1,247141556.69,247.14,599,40.07
+Stress 1: Exclude Top 1 Winner (DIXON: +439%),DIXON,22.04,-27.38,208250433.85,208.25,603,39.8
+"Stress 2: Exclude Top 3 Winners (DIXON, BAJFINANCE, UNITECH)","DIXON, BAJFINANCE, UNITECH",19.48,-27.38,117959273.15,117.96,619,40.23
+"Stress 3: Exclude Top 5 Winners (DIXON, BAJFINANCE, UNITECH, BHEL, STLTECH)","DIXON, BAJFINANCE, UNITECH, BHEL, STLTECH",17.07,-34.0,68363432.61,68.36,641,39.94

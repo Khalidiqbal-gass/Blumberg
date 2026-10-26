@@ -1,0 +1,2 @@
+Metric,Worst_Case_5th_CAGR_%,Median_50th_CAGR_%,Best_Case_95th_CAGR_%,Worst_Case_5th_MaxDD_%,Median_50th_MaxDD_%,Worst_Case_Final_Capital_Rs,Median_Final_Capital_Rs,Best_Case_Final_Capital_Rs
+"Monte Carlo 1,000 Runs",11.46,20.01,30.34,-39.11,-25.7,18324439.54,132657800.73,1213458669.52
