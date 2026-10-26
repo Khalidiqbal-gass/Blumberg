@@ -127,7 +127,11 @@ class UpgradedVCPBacktestEngine:
         within_15pct_52w = df["close"] >= 0.85 * df["high_52w"]
         base_consolidation = (df["ret_20d"] > 0.0) & (df["ret_20d"] <= 0.35)
         volume_ignition = (df["ret_5d"] > 0.0) & (df["rvol"] >= 1.5)
-        liquidity_ok = df["turnover"] >= 30_000_000.0  # Rs 3 Crores
+        # Dynamic inflation/market-cap scaled liquidity floor:
+        # Pre-2008: Rs 25 Lakhs | 2008-2015: Rs 1 Crore | 2016+: Rs 3 Crores
+        year_s = df["date"].dt.year
+        dyn_floor = np.where(year_s < 2008, 2_500_000.0, np.where(year_s < 2016, 10_000_000.0, 30_000_000.0))
+        liquidity_ok = df["turnover"] >= dyn_floor
 
         df["raw_signal"] = (
             vcp_contraction &
@@ -182,7 +186,7 @@ class UpgradedVCPBacktestEngine:
         if not sim_dates:
             sim_dates = all_dates
 
-        # 3. Simulation State
+        # 3. Simulation State (Senior Quant Hardened: No Lookahead, Real Cash Settlement)
         cash = self.initial_capital
         active_trades: dict[str, UpgradedTrade] = {}
         closed_trades: list[UpgradedTrade] = []
@@ -190,22 +194,119 @@ class UpgradedVCPBacktestEngine:
         total_friction_paid = 0.0
 
         for d_idx, cur_date in enumerate(sim_dates):
-            # A. Evaluate Active Positions on cur_date
+            # -------------------------------------------------------------
+            # STEP 1: MORNING MARKET OPEN (9:15 AM) - NEW ENTRIES EXECUTION
+            # -------------------------------------------------------------
+            # Rule: Entries at 9:15 AM can ONLY use cash and slots available
+            # from yesterday's close. Exit proceeds from today's trades are NOT
+            # yet available (T+1 cash settlement / prevents same-day cash recycling).
+            existing_symbols = list(active_trades.keys())
+            available_cash_for_entry = cash
+            available_slots = max(0, self.max_slots - len(existing_symbols))
+
+            orig_idx = date_to_idx.get(cur_date, 0)
+            if orig_idx > 0 and available_slots > 0 and available_cash_for_entry >= 10_000.0:
+                prev_date = all_dates[orig_idx - 1]
+                regime_ok = bench_regime_dict.get(prev_date, True)
+
+                if regime_ok:
+                    candidates: list[dict[str, Any]] = []
+                    for sym, s_df in symbol_data.items():
+                        if sym in active_trades:
+                            continue
+                        if prev_date in s_df.index and s_df.loc[prev_date, "raw_signal"]:
+                            p_row = s_df.loc[prev_date]
+                            candidates.append({
+                                "symbol": sym,
+                                "rs_score": p_row["rs_score"],
+                                "rvol": p_row["rvol"],
+                                "atr_14": p_row["atr_14"],
+                            })
+
+                    # Cross-Sectional Ranking: Sort by RS * RVOL Score Descending
+                    candidates.sort(key=lambda x: x["rs_score"], reverse=True)
+
+                    for cand in candidates:
+                        if available_slots <= 0 or available_cash_for_entry < 10_000.0:
+                            break
+
+                        sym = cand["symbol"]
+                        s_df = symbol_data[sym]
+                        if cur_date not in s_df.index:
+                            continue
+                        bar = s_df.loc[cur_date]
+
+                        # Upper Circuit Rejection: open == high == low
+                        if bar["open"] == bar["high"] and bar["high"] == bar["low"]:
+                            continue
+
+                        # Calculate Total Current Portfolio Equity at Open
+                        mtm_val_open = sum(
+                            symbol_data[s].loc[cur_date]["open"] * t.shares
+                            if cur_date in symbol_data[s].index else t.invested_capital
+                            for s, t in active_trades.items()
+                        )
+                        current_equity_open = cash + mtm_val_open
+
+                        # 1% Equity Risk Parity Sizing
+                        dollar_risk = current_equity_open * self.risk_per_trade_pct
+                        atr_val = cand["atr_14"] if pd.notnull(cand["atr_14"]) else bar["open"] * 0.03
+                        unit_risk = max(bar["open"] * 0.08, 2.5 * atr_val)
+                        target_shares = dollar_risk / unit_risk
+                        target_capital = target_shares * bar["open"]
+
+                        # Cap at max slot allocation (e.g. 1/15th of equity)
+                        max_slot_capital = current_equity_open / self.max_slots
+                        alloc_capital = min(target_capital, max_slot_capital, available_cash_for_entry)
+
+                        if alloc_capital < 10_000.0 or available_cash_for_entry < alloc_capital:
+                            continue
+
+                        # Execute Entry at Open with Friction
+                        raw_entry = bar["open"]
+                        entry_friction = alloc_capital * self.cost_per_side
+                        total_friction_paid += entry_friction
+                        actual_invest = alloc_capital - entry_friction
+                        shares = actual_invest / raw_entry
+
+                        cash -= alloc_capital
+                        available_cash_for_entry -= alloc_capital
+                        available_slots -= 1
+
+                        entry_price_with_friction = raw_entry * (1.0 + self.cost_per_side)
+
+                        active_trades[sym] = UpgradedTrade(
+                            symbol=sym,
+                            entry_date=cur_date,
+                            entry_price=raw_entry,
+                            entry_price_with_friction=entry_price_with_friction,
+                            shares=shares,
+                            invested_capital=alloc_capital,
+                            dollar_risk=dollar_risk,
+                            peak_price=raw_entry,
+                        )
+
+            # -------------------------------------------------------------
+            # STEP 2: INTRADAY & CLOSING POSITION MANAGEMENT (EXITS)
+            # -------------------------------------------------------------
+            # Only evaluate positions held overnight (entered prior to today).
+            # Hardened against Intraday Lookahead:
+            # Trailing floors and initial stop-loss are evaluated using the
+            # peak price reached BEFORE today. Peak price is updated ONLY if
+            # the position survives today's stops without exiting.
             symbols_to_close: list[str] = []
 
-            for sym, tr in active_trades.items():
+            for sym in existing_symbols:
+                tr = active_trades[sym]
                 s_df = symbol_data[sym]
                 if cur_date not in s_df.index:
                     continue
                 bar = s_df.loc[cur_date]
-                
-                # Update peak price
-                if bar["high"] > tr.peak_price:
-                    tr.peak_price = bar["high"]
-                
-                gain_from_entry = (tr.peak_price / tr.entry_price - 1.0) * 100.0
-                curr_gain = (bar["close"] / tr.entry_price - 1.0) * 100.0
-                dip_from_peak = (bar["close"] / tr.peak_price - 1.0) * 100.0
+
+                # Peak price established prior to today
+                prior_peak = tr.peak_price
+                gain_from_entry = (prior_peak / tr.entry_price - 1.0) * 100.0
+                dip_from_peak = (bar["close"] / prior_peak - 1.0) * 100.0
 
                 exit_triggered = False
                 exit_price = 0.0
@@ -215,48 +316,49 @@ class UpgradedVCPBacktestEngine:
                 # -------------------------------------------------------------
                 # STAGE 5: PARABOLIC CLIMAX EXIT (Blow-off Top check)
                 # -------------------------------------------------------------
-                is_climax = (bar["close"] / bar["ema100"] - 1.0) > 0.60
-                if is_climax:
-                    tr.is_climax_reached = True
-
                 if tr.is_climax_reached and gain_from_entry >= 50.0:
-                    # Tighten stop: 20 EMA or 15% peak drop
                     if bar["close"] < bar["ema20"] or dip_from_peak <= -15.0:
                         exit_triggered = True
-                        exit_price = max(bar["close"], tr.entry_price * 1.25)
+                        exit_price = min(bar["open"], bar["close"]) if bar["open"] < bar["close"] else bar["close"]
                         exit_reason = "Parabolic Climax Exit (Blow-off Top Protection)"
                         stage_name = "Stage 5: Climax Exit"
 
                 # -------------------------------------------------------------
-                # STAGE 4: SECULAR COMPOUNDING (Peak Gain >= 50%)
+                # STAGE 4: SECULAR COMPOUNDING (Prior Peak Gain >= 50%)
                 # -------------------------------------------------------------
                 elif gain_from_entry >= 50.0 and not exit_triggered:
-                    # Hard floor locked at +25%
-                    if bar["low"] <= tr.entry_price * 1.25:
+                    floor_4 = tr.entry_price * 1.25
+                    # Hard floor locked at +25% (Gap-Down Protected: min, never max)
+                    if bar["low"] <= floor_4:
                         exit_triggered = True
-                        exit_price = max(tr.entry_price * 1.25, bar["open"])
+                        exit_price = min(floor_4, bar["open"])
                         exit_reason = "Secular Profit Floor (+25% Locked)"
                         stage_name = "Stage 4: Secular Compounding"
                     elif bar["close"] < bar["ema100"] and dip_from_peak <= -20.0:
                         exit_triggered = True
-                        exit_price = max(bar["close"], tr.entry_price * 1.25)
+                        exit_price = min(bar["open"], bar["close"]) if bar["open"] < bar["close"] else bar["close"]
                         exit_reason = "Secular Trend Ended (100 EMA Break & -20% Drop)"
                         stage_name = "Stage 4: Secular Compounding"
 
                 # -------------------------------------------------------------
-                # STAGE 3: PROGRESSIVE RATCHET (+30% <= Peak Gain < +50%)
+                # STAGE 3: PROGRESSIVE RATCHET (+30% <= Prior Peak Gain < +50%)
                 # -------------------------------------------------------------
                 elif 30.0 <= gain_from_entry < 50.0 and not exit_triggered:
-                    floor_price = max(tr.entry_price * 1.12, bar["ema50"])
-                    if bar["close"] < floor_price or bar["low"] <= tr.entry_price * 1.12:
+                    floor_12 = tr.entry_price * 1.12
+                    floor_price = max(floor_12, bar["ema50"])
+                    if bar["low"] <= floor_12:
                         exit_triggered = True
-                        exit_price = min(floor_price, bar["open"]) if bar["open"] < floor_price else floor_price
-                        exit_price = max(exit_price, tr.entry_price * 1.12)
+                        exit_price = min(floor_12, bar["open"])
+                        exit_reason = "Progressive Floor Ratchet (+12% / 50 EMA Locked)"
+                        stage_name = "Stage 3: Progressive Ratchet"
+                    elif bar["close"] < floor_price:
+                        exit_triggered = True
+                        exit_price = min(floor_price, bar["open"]) if bar["open"] < floor_price else bar["close"]
                         exit_reason = "Progressive Floor Ratchet (+12% / 50 EMA Locked)"
                         stage_name = "Stage 3: Progressive Ratchet"
 
                 # -------------------------------------------------------------
-                # STAGE 2: CAPITAL PRESERVATION (+15% <= Peak Gain < +30%)
+                # STAGE 2: CAPITAL PRESERVATION (+15% <= Prior Peak Gain < +30%)
                 # -------------------------------------------------------------
                 elif 15.0 <= gain_from_entry < 30.0 and not exit_triggered:
                     be_floor = tr.entry_price * 1.02
@@ -267,10 +369,9 @@ class UpgradedVCPBacktestEngine:
                         stage_name = "Stage 2: Capital Preservation"
 
                 # -------------------------------------------------------------
-                # STAGE 1: IGNITION DEFENSE (Peak Gain < +15%)
+                # STAGE 1: IGNITION DEFENSE (Prior Peak Gain < +15%)
                 # -------------------------------------------------------------
                 elif gain_from_entry < 15.0 and not exit_triggered:
-                    # Closing-basis stop: Max(-8%, Entry - 2.5 * ATR_14)
                     atr_entry = bar["atr_14"] if pd.notnull(bar["atr_14"]) else bar["close"] * 0.03
                     closing_stop = max(tr.entry_price * 0.92, tr.entry_price - 2.5 * atr_entry)
 
@@ -282,7 +383,7 @@ class UpgradedVCPBacktestEngine:
                         stage_name = "Stage 1: Ignition Defense"
                     elif bar["close"] <= closing_stop:
                         exit_triggered = True
-                        exit_price = bar["close"]
+                        exit_price = min(closing_stop, bar["open"]) if bar["open"] < closing_stop else bar["close"]
                         exit_reason = "Closing ATR Stop-Loss"
                         stage_name = "Stage 1: Ignition Defense"
                     # Time-Stop (Dead Money): Bars >= 30, Gain < 10%, Close < 20 EMA
@@ -297,7 +398,7 @@ class UpgradedVCPBacktestEngine:
                     sell_friction = exit_price * tr.shares * self.cost_per_side
                     net_proceeds = (exit_price * tr.shares) - sell_friction
                     total_friction_paid += sell_friction
-                    cash += net_proceeds
+                    cash += net_proceeds  # Becomes available starting next day
 
                     tr.exit_date = cur_date
                     tr.exit_price = exit_price
@@ -315,94 +416,29 @@ class UpgradedVCPBacktestEngine:
                     closed_trades.append(tr)
                     symbols_to_close.append(sym)
                 else:
+                    # Trade survived today's session: update peak price & climax flag safely
+                    if bar["high"] > tr.peak_price:
+                        tr.peak_price = bar["high"]
+                    is_climax = (bar["close"] / bar["ema100"] - 1.0) > 0.60
+                    if is_climax:
+                        tr.is_climax_reached = True
                     tr.bars_held += 1
 
             for sym in symbols_to_close:
                 del active_trades[sym]
 
-            # B. Check Previous Day Signals for Next Day (cur_date) Open Entry
-            orig_idx = date_to_idx.get(cur_date, 0)
-            if orig_idx > 0:
-                prev_date = all_dates[orig_idx - 1]
-                regime_ok = bench_regime_dict.get(prev_date, True)
+            # Update peak price for newly entered positions on their entry day
+            for sym, tr in active_trades.items():
+                if sym not in existing_symbols:
+                    s_df = symbol_data[sym]
+                    if cur_date in s_df.index:
+                        b = s_df.loc[cur_date]
+                        if b["high"] > tr.peak_price:
+                            tr.peak_price = b["high"]
 
-                # Only evaluate entries if Benchmark Regime is Bullish (Regime Filter)
-                if regime_ok:
-                    candidates: list[dict[str, Any]] = []
-                    for sym, s_df in symbol_data.items():
-                        if sym in active_trades:
-                            continue  # No overlapping trades in same symbol
-                        if prev_date in s_df.index and s_df.loc[prev_date, "raw_signal"]:
-                            p_row = s_df.loc[prev_date]
-                            candidates.append({
-                                "symbol": sym,
-                                "rs_score": p_row["rs_score"],
-                                "rvol": p_row["rvol"],
-                                "atr_14": p_row["atr_14"],
-                            })
-
-                    # Cross-Sectional Ranking: Sort by RS * RVOL Score Descending
-                    candidates.sort(key=lambda x: x["rs_score"], reverse=True)
-
-                    for cand in candidates:
-                        sym = cand["symbol"]
-                        s_df = symbol_data[sym]
-                        if cur_date not in s_df.index:
-                            continue
-                        bar = s_df.loc[cur_date]
-
-                        # Upper Circuit Rejection: open == high == low
-                        if bar["open"] == bar["high"] and bar["high"] == bar["low"]:
-                            continue
-
-                        # Check Free Slot availability
-                        if len(active_trades) >= self.max_slots:
-                            break
-
-                        # Calculate Total Current Portfolio Equity
-                        mtm_val = sum(
-                            symbol_data[s].loc[cur_date]["close"] * t.shares
-                            if cur_date in symbol_data[s].index else t.invested_capital
-                            for s, t in active_trades.items()
-                        )
-                        current_equity = cash + mtm_val
-
-                        # 1% Equity Risk Parity Sizing
-                        dollar_risk = current_equity * self.risk_per_trade_pct
-                        atr_val = cand["atr_14"] if pd.notnull(cand["atr_14"]) else bar["open"] * 0.03
-                        unit_risk = max(bar["open"] * 0.08, 2.5 * atr_val)
-                        target_shares = dollar_risk / unit_risk
-                        target_capital = target_shares * bar["open"]
-
-                        # Cap at max slot allocation (e.g. 1/15th of equity)
-                        max_slot_capital = current_equity / self.max_slots
-                        alloc_capital = min(target_capital, max_slot_capital, cash)
-
-                        if alloc_capital < 10_000.0 or cash < alloc_capital:
-                            continue
-
-                        # Entry Execution at Day t+1 Open with Friction
-                        raw_entry = bar["open"]
-                        entry_friction = alloc_capital * self.cost_per_side
-                        total_friction_paid += entry_friction
-                        actual_invest = alloc_capital - entry_friction
-                        shares = actual_invest / raw_entry
-                        cash -= alloc_capital
-
-                        entry_price_with_friction = raw_entry * (1.0 + self.cost_per_side)
-
-                        active_trades[sym] = UpgradedTrade(
-                            symbol=sym,
-                            entry_date=cur_date,
-                            entry_price=raw_entry,
-                            entry_price_with_friction=entry_price_with_friction,
-                            shares=shares,
-                            invested_capital=alloc_capital,
-                            dollar_risk=dollar_risk,
-                            peak_price=raw_entry,
-                        )
-
-            # C. Record Daily Portfolio Mark-to-Market Equity
+            # -------------------------------------------------------------
+            # STEP 3: DAILY PORTFOLIO MARK-TO-MARKET VALUATION
+            # -------------------------------------------------------------
             curr_mtm = 0.0
             for s, t in active_trades.items():
                 s_df = symbol_data[s]

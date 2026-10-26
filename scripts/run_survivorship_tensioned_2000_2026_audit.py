@@ -130,17 +130,16 @@ def simulate_stock_trades(
                 peak_date = entry_date
         else:
             cur_date = pd.to_datetime(row["date"])
+            cur_open = float(row["open"])
             cur_high = float(row["high"])
             cur_low = float(row["low"])
             cur_close = float(row["close"])
             days_held = i - entry_idx + 1
 
-            if cur_high > peak_price:
-                peak_price = cur_high
-                peak_date = cur_date
-
-            peak_gain_pct = (peak_price / entry_price - 1.0) * 100.0
-            dip_from_peak_pct = (cur_close / peak_price - 1.0) * 100.0
+            # Hardened against Lookahead: evaluate trailing stops using prior peak
+            prior_peak = peak_price
+            peak_gain_pct = (prior_peak / entry_price - 1.0) * 100.0
+            dip_from_peak_pct = (cur_close / prior_peak - 1.0) * 100.0
 
             if peak_gain_pct >= 100.0:
                 trail_buffer = 20.0
@@ -151,9 +150,11 @@ def simulate_stock_trades(
             else:
                 trail_buffer = None
 
-            # 1. Hard Initial Stop Loss (-8.0%)
+            # 1. Hard Initial Stop Loss (-8.0% with Gap-Down Protection)
             if (cur_low <= entry_price * (1.0 - initial_stop_pct / 100.0)) and (peak_gain_pct < breakeven_trigger_pct):
-                exit_price = entry_price * (1.0 - initial_stop_pct / 100.0) * (1.0 - cost_factor)
+                stop_floor = entry_price * (1.0 - initial_stop_pct / 100.0)
+                fill_price = min(stop_floor, cur_open)
+                exit_price = fill_price * (1.0 - cost_factor)
                 net_ret = (exit_price / entry_price - 1.0) * 100.0
                 trades.append({
                     "symbol": clean_sym,
@@ -313,33 +314,72 @@ def run_survivorship_tensioned_audit():
     logger.info(f"  - Total Super-Runners (3x+): {trades_df['is_multibagger_3x'].sum()}")
     logger.info("-" * 60)
 
-    # 4. Portfolio Allocation & Drawdown Matrix (Tensioned Model)
+    # 4. Portfolio Allocation & Drawdown Matrix (True Concurrent Multi-Slot Simulation)
     years_26 = 26.8
     allocation_matrix = []
+    market_dates = sorted(bench_df["date"].unique())
 
-    for alloc, label in [
-        (0.10, "Aggressive (10% Slot / 10 Positions)"),
-        (0.075, "Balanced Growth (7.5% Slot / ~13 Positions)"),
-        (0.05, "Optimal Institutional (5% Slot / 20 Positions)"),
-        (0.03, "Conservative Low-DD (3% Slot / 33 Positions)"),
+    # Pre-index trades by entry_date
+    trades_by_entry = {}
+    for _, tr in trades_df.sort_values("entry_date").iterrows():
+        trades_by_entry.setdefault(tr["entry_date"], []).append(tr)
+
+    for alloc, max_slots, label in [
+        (0.10, 10, "Aggressive (10% Slot / 10 Positions)"),
+        (0.075, 13, "Balanced Growth (7.5% Slot / ~13 Positions)"),
+        (0.05, 20, "Optimal Institutional (5% Slot / 20 Positions)"),
+        (0.03, 33, "Conservative Low-DD (3% Slot / 33 Positions)"),
     ]:
-        cap = 1_000_000.0
-        equity = [cap]
-        for _, tr in trades_df.iterrows():
-            gain = (cap * alloc) * (tr["net_return_pct"] / 100.0)
-            cap += gain
-            equity.append(cap)
-        eq = pd.Series(equity)
-        mdd = compute_max_drawdown(eq)
-        cagr = compute_cagr(1_000_000.0, cap, years_26)
+        cash = 1_000_000.0
+        active_pos = []
+        equity_hist = []
+
+        for c_date in market_dates:
+            # A. Settle Exits
+            surv = []
+            for p in active_pos:
+                if p["exit_date"] <= c_date:
+                    proceeds = p["invested"] * (1.0 + p["net_return_pct"] / 100.0)
+                    cash += proceeds
+                else:
+                    surv.append(p)
+            active_pos = surv
+
+            # B. Allocate New Entries
+            cur_equity = cash + sum(p["invested"] for p in active_pos)
+            free_slots = max_slots - len(active_pos)
+            if free_slots > 0 and c_date in trades_by_entry and cash >= 5_000:
+                slot_cap = cur_equity / max_slots
+                for tr in trades_by_entry[c_date]:
+                    if free_slots <= 0 or cash < 5_000:
+                        break
+                    p_alloc = min(cash, slot_cap)
+                    cash -= p_alloc
+                    free_slots -= 1
+                    active_pos.append({
+                        "symbol": tr["symbol"],
+                        "invested": p_alloc,
+                        "exit_date": tr["exit_date"],
+                        "net_return_pct": tr["net_return_pct"],
+                    })
+
+            # C. Mark to market
+            daily_eq = cash + sum(p["invested"] for p in active_pos)
+            equity_hist.append(daily_eq)
+
+        eq_s = pd.Series(equity_hist)
+        final_cap = float(eq_s.iloc[-1])
+        mdd = compute_max_drawdown(eq_s)
+        cagr = compute_cagr(1_000_000.0, final_cap, years_26)
+
         allocation_matrix.append({
             "Allocation Profile": label,
             "Slot Size": f"{alloc*100:.1f}%",
             "26-Yr CAGR %": f"{cagr:.1f}%",
             "Max Drawdown %": f"{mdd:.1f}%",
-            "₹10L Compounded To": f"₹{cap/100000:,.1f} Lakhs",
+            "₹10L Compounded To": f"₹{final_cap/100000:,.1f} Lakhs",
             "Multibaggers Retained": f"{trades_df['is_multibagger_2x'].sum()} Stocks",
-            "Risk Profile": "Low Drawdown" if abs(mdd) < 55 else ("Moderate" if abs(mdd) < 70 else "High Volatility")
+            "Risk Profile": "Low Drawdown" if abs(mdd) < 35 else ("Moderate" if abs(mdd) < 55 else "High Volatility")
         })
 
     alloc_df = pd.DataFrame(allocation_matrix)

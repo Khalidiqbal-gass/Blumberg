@@ -381,9 +381,18 @@ def update_pipeline_with_bars(
             continue
 
         sym_bars = bars_by_symbol[sym]
-        entry_dt = pd.to_datetime(r.date_added, utc=True)
+        entry_dt = pd.to_datetime(r.date_added)
+        sym_dates = pd.to_datetime(sym_bars["date"])
+        if sym_dates.dt.tz is not None:
+            if entry_dt.tz is None:
+                entry_dt = entry_dt.tz_localize("UTC")
+            else:
+                entry_dt = entry_dt.tz_convert("UTC")
+        else:
+            if entry_dt.tz is not None:
+                entry_dt = entry_dt.tz_localize(None)
         # Slices candles on or after entry date
-        post_entry = sym_bars[sym_bars["date"] >= entry_dt].reset_index(drop=True)
+        post_entry = sym_bars[sym_dates >= entry_dt].reset_index(drop=True)
 
         if post_entry.empty:
             # Entry date may be today or after latest cached bar

@@ -101,7 +101,8 @@ def compute_pre_rally_features(
         df["range_compression_ratio"] = (range_20d / range_60d.replace(0, np.nan)).clip(0.1, 1.5)
 
         # 5. Distance to 52-Week High (250 sessions)
-        roll_250_high = h.rolling(250, min_periods=20).max()
+        # 5. Distance to 52-Week High (250 sessions - shifted by 1 to prevent lookahead)
+        roll_250_high = h.shift(1).rolling(250, min_periods=20).max()
         df["high_52w"] = roll_250_high
         df["dist_to_52w_high_pct"] = (c / roll_250_high - 1.0) * 100.0
 
@@ -233,11 +234,6 @@ def score_pre_rally_candidates(
                 valid_events = sym_events[(ev_dates <= curr_date) & ((curr_date - ev_dates).dt.days <= 120)]
                 if not valid_events.empty:
                     ev = valid_events.iloc[0]
-                    has_catalyst = True
-                    catalyst_desc = str(ev.get("headline", ""))
-                    catalyst_order_val = ev.get("order_value_cr")
-                elif pd.isna(curr_date) or ev_dates.isna().all():
-                    ev = sym_events.iloc[0]
                     has_catalyst = True
                     catalyst_desc = str(ev.get("headline", ""))
                     catalyst_order_val = ev.get("order_value_cr")

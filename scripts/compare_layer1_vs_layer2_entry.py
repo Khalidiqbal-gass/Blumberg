@@ -130,16 +130,16 @@ def simulate_universe(entry_mode: str = "LAYER_1"):
                         
             elif in_pos:
                 cur_date = pd.to_datetime(row["date"])
+                cur_open = float(row["open"])
                 cur_high = float(row["high"])
                 cur_low = float(row["low"])
                 cur_close = float(row["close"])
                 days_held = i - entry_idx + 1
                 
-                if cur_high > peak_price:
-                    peak_price = cur_high
-                    
-                peak_gain_pct = (peak_price / entry_price - 1.0) * 100.0
-                dip_from_peak_pct = (cur_close / peak_price - 1.0) * 100.0
+                # Hardened against Lookahead: evaluate trailing stops using prior peak
+                prior_peak = peak_price
+                peak_gain_pct = (prior_peak / entry_price - 1.0) * 100.0
+                dip_from_peak_pct = (cur_close / prior_peak - 1.0) * 100.0
                 
                 if peak_gain_pct >= 100.0:
                     trail_buffer = 20.0
@@ -150,9 +150,10 @@ def simulate_universe(entry_mode: str = "LAYER_1"):
                 else:
                     trail_buffer = None
                     
-                # 1. Hard Initial Stop Loss (-8%)
+                # 1. Hard Initial Stop Loss (-8% with gap-down fill)
                 if (cur_low <= entry_price * 0.92) and (peak_gain_pct < 15.0):
-                    exit_price = entry_price * 0.92 * (1.0 - cost_factor)
+                    fill_p = min(entry_price * 0.92, cur_open)
+                    exit_price = fill_p * (1.0 - cost_factor)
                     net_ret = (exit_price / entry_price - 1.0) * 100.0
                     trades.append({
                         "symbol": sym, "entry_date": entry_date, "exit_date": cur_date,
@@ -198,6 +199,10 @@ def simulate_universe(entry_mode: str = "LAYER_1"):
                         "exit_reason": "STAGNATION_TIMEOUT"
                     })
                     in_pos = False
+
+                if in_pos:
+                    if cur_high > peak_price:
+                        peak_price = cur_high
                     
     tdf = pd.DataFrame(trades).sort_values("entry_date").reset_index(drop=True)
     tdf["win"] = tdf["net_return_pct"] > 0
