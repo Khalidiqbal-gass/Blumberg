@@ -1,12 +1,12 @@
 """
-Live Autonomous Paper Portfolio Engine (HYBRID_50_50 Institutional Champion Model).
+Live Autonomous Paper Portfolio Engine (HYBRID_50_50 Institutional 10-Slot Champion Model).
 
 Manages an active portfolio ledger implementing:
 1. Configurable initial capital (Default: Rs. 10 Lakhs = Rs. 1,000,000).
-2. Exactly 7 Equal-Weight Portfolio Slots (14.28% allocation per slot).
+2. Exactly 10 Equal-Weight Portfolio Slots (10.0% allocation per slot).
 3. 2-Tranche Fast Pyramiding:
-   - Tranche 1 (50% = 7.14%) at Day 0 VCP Breakout base.
-   - Tranche 2 (50% = 7.14%) at Day 7 Confirmation ONLY if in profit.
+   - Tranche 1 (50% = 5.0%) at Day 0 VCP Breakout base.
+   - Tranche 2 (50% = 5.0%) at Day 7 Confirmation ONLY if in profit.
 4. 5-Stage Multi-Tiered Dynamic Exit Engine:
    - Stage 1: Hard Stop (-10%) / ATR Stop (-8%) / 30d Dead-Money Stop
    - Stage 2: Breakeven Floor (+2% Profit Locked) at +15% Peak
