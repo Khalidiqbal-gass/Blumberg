@@ -1,0 +1,4 @@
+Configuration,Mode,Total_Trades,Win_Rate_Pct,Net_CAGR_Pct,Max_Drawdown_Pct,Profit_Factor,Payoff_Ratio,Final_Capital_Rs,Multiple,Total_Friction_Paid_Rs
+HYBRID_50_50 (Recommended Sweet-Spot),HYBRID_50_50,188,37.77,15.1,-18.74,1.94,2.78,2261637.82,2.26,399770.98
+LAYER_1_FULL (Aggressive Day 0),LAYER_1_FULL,175,40.57,15.43,-23.23,1.76,3.52,2298887.5,2.3,399390.7
+LAYER_2_CONFIRMATION (10d Incubation),LAYER_2_CONFIRMATION,155,47.74,12.25,-21.35,1.9,2.33,1955334.11,1.96,304269.18
