@@ -49,6 +49,7 @@ LAYER_3_NAME = staged_mod.LAYER_3_NAME
 LAYER_4_NAME = staged_mod.LAYER_4_NAME
 from blumberg_market_radar.backtest.mfe_mae import evaluate_pre_rally_signals
 from blumberg_market_radar.ledger.journal import record_signal_snapshots, load_signal_ledger
+from blumberg_market_radar.pipeline.live_portfolio import LivePortfolioManager
 
 # Streamlit Page Config
 st.set_page_config(
@@ -410,8 +411,12 @@ with col5:
         unsafe_allow_html=True,
     )
 
-# 8 Core Master Brief Navigation Tabs
-tab_overview, tab_candidates, tab_terminal, tab_events, tab_validation, tab_ml, tab_ledger, tab_health = st.tabs([
+# Initialize Live Portfolio Manager (Default Rs. 10 Lakhs, 7 Slots)
+portfolio_mgr = LivePortfolioManager(initial_capital=1_000_000.0, max_slots=7)
+
+# Navigation Tabs (Featuring Live Model Portfolio)
+tab_portfolio, tab_overview, tab_candidates, tab_terminal, tab_events, tab_validation, tab_ml, tab_ledger, tab_health = st.tabs([
+    "💼 Live Model Portfolio (₹10L)",
     "🌐 Market Overview",
     "📡 Early Rally Candidates",
     "📈 Stock Detail & Footprint",
@@ -421,6 +426,156 @@ tab_overview, tab_candidates, tab_terminal, tab_events, tab_validation, tab_ml, 
     "📑 Signal Journal",
     "🩺 System Health",
 ])
+
+# ----------------- TAB 0: LIVE MODEL PORTFOLIO -----------------
+with tab_portfolio:
+    st.markdown("#### 💼 Autonomous Paper Portfolio (HYBRID_50_50 Champion Model)")
+    st.caption("Live execution engine managing ₹10 Lakhs capital with 7 equal-weight slots, 2-tranche fast pyramiding, and 5-stage dynamic floor exits.")
+
+    latest_close_dict = bars_df.groupby("symbol")["close"].last().to_dict() if not bars_df.empty else {}
+    port_summary = portfolio_mgr.get_summary(latest_close_dict)
+
+    # Top KPI ribbon
+    pk1, pk2, pk3, pk4, pk5 = st.columns(5)
+    with pk1:
+        st.metric("💰 Total Portfolio Value", f"₹{port_summary['total_equity']:,.2f}", f"{port_summary['total_return_pct']:+.2f}% Overall")
+    with pk2:
+        st.metric("💵 Settled Cash Available", f"₹{port_summary['cash']:,.2f}", "Ready for deployment")
+    with pk3:
+        st.metric("📊 Invested Holdings Value", f"₹{port_summary['market_value_holdings']:,.2f}", f"{port_summary['unrealized_pnl_pct']:+.2f}% Unrealized PnL")
+    with pk4:
+        st.metric("🏆 Realized PnL", f"₹{port_summary['realized_pnl_rs']:+,.2f}", f"Win Rate: {port_summary['win_rate_pct']:.1f}%")
+    with pk5:
+        st.metric("🎯 Slot Utilization", f"{port_summary['active_positions_count']} / {port_summary['max_slots']} Slots", f"{port_summary['available_slots']} Free Slots")
+
+    # Action Toolbar
+    st.markdown("###### ⚙️ Autonomous Execution & Rebalance Controls")
+    ac1, ac2, ac3, ac4 = st.columns([1.6, 1.2, 1.1, 1.1])
+    with ac1:
+        col_btn1, col_chk = st.columns([1.2, 1.0])
+        with col_btn1:
+            btn_exec = st.button("⚡ Execute Today's Rebalance", use_container_width=True, type="primary")
+        with col_chk:
+            enforce_regime_ui = st.checkbox("Enforce Nifty 50 Regime", value=True, help="When checked, delays new entries if Nifty is below 50 EMA. When unchecked, allows entries in all regimes.")
+        
+        if btn_exec:
+            with st.spinner("Executing model decisions (Stops -> Tranche 2 -> New Entries)..."):
+                rebalance_res = portfolio_mgr.execute_daily_rebalance(
+                    bars_df=bars_df,
+                    bench_df=bench_df,
+                    candidates_df=filtered_ranked,
+                    enforce_regime=enforce_regime_ui,
+                )
+                if rebalance_res["actions_taken"]:
+                    for act in rebalance_res["actions_taken"]:
+                        st.write(act)
+                    st.success(f"Executed {len(rebalance_res['actions_taken'])} autonomous order(s) successfully!")
+                else:
+                    st.info("No rebalance actions required today (Regime or active holdings all healthy).")
+                st.rerun()
+
+    with ac2:
+        new_cap = st.selectbox(
+            "Initial Capital Tier:",
+            [1_000_000.0, 2_500_000.0, 5_000_000.0, 10_000_000.0],
+            format_func=lambda x: f"₹{x/100000:.0f} Lakhs" if x < 10000000 else f"₹{x/10000000:.1f} Crore",
+            index=0,
+            key="sel_capital_reset"
+        )
+    with ac3:
+        if st.button("🔄 Reset Portfolio", use_container_width=True, help="Reset cash to selected capital and clear active positions"):
+            portfolio_mgr.reset_portfolio(capital=new_cap)
+            st.success(f"Portfolio reset to ₹{new_cap:,.0f}!")
+            st.rerun()
+    with ac4:
+        state_json = json.dumps(portfolio_mgr.state.__dict__, indent=2).encode("utf-8")
+        st.download_button("📥 Export JSON", state_json, "live_portfolio_state.json", "application/json", use_container_width=True)
+
+    st.markdown("---")
+
+    # Active Holdings Section
+    st.markdown("##### 📈 Active Portfolio Holdings (7 Max Slots — 14.28% Allocation Each)")
+    active_pos = list(portfolio_mgr.state.active_positions.values())
+    if not active_pos:
+        st.info("No active holdings currently in portfolio. Click '**⚡ Execute Today's Rebalance**' above to deploy capital into today's top VCP candidates!")
+    else:
+        active_df = pd.DataFrame(active_pos)
+        # Update current price from latest close if available
+        for idx, row in active_df.iterrows():
+            sym = row["symbol"]
+            if sym in latest_close_dict:
+                active_df.at[idx, "current_price"] = latest_close_dict[sym]
+                entry_p = row["entry_price"]
+                active_df.at[idx, "current_gain_pct"] = (latest_close_dict[sym] / entry_p - 1.0) * 100.0
+                active_df.at[idx, "unrealized_pnl_rs"] = (latest_close_dict[sym] * row["shares"]) - row["invested_capital"]
+
+        st.dataframe(
+            active_df[[
+                "symbol", "current_stage", "shares", "invested_capital", "entry_price", 
+                "current_price", "current_gain_pct", "unrealized_pnl_rs", "tranche2_active",
+                "stop_loss_price", "profit_floor_price", "bars_held", "sector"
+            ]].rename(columns={
+                "symbol": "Symbol",
+                "current_stage": "Active Stage",
+                "shares": "Shares",
+                "invested_capital": "Invested (₹)",
+                "entry_price": "Avg Entry (₹)",
+                "current_price": "Current LTP (₹)",
+                "current_gain_pct": "P&L %",
+                "unrealized_pnl_rs": "Unrealized P&L (₹)",
+                "tranche2_active": "Tranche 2 Active?",
+                "stop_loss_price": "Stop-Loss (₹)",
+                "profit_floor_price": "Profit Floor (₹)",
+                "bars_held": "Days Held",
+                "sector": "Sector Theme",
+            }),
+            column_config={
+                "Invested (₹)": st.column_config.NumberColumn("Invested (₹)", format="₹%.2f"),
+                "Avg Entry (₹)": st.column_config.NumberColumn("Avg Entry (₹)", format="₹%.2f"),
+                "Current LTP (₹)": st.column_config.NumberColumn("Current LTP (₹)", format="₹%.2f"),
+                "P&L %": st.column_config.NumberColumn("P&L %", format="%+.2f%%"),
+                "Unrealized P&L (₹)": st.column_config.NumberColumn("Unrealized P&L (₹)", format="₹%+,.2f"),
+                "Stop-Loss (₹)": st.column_config.NumberColumn("Stop-Loss (₹)", format="₹%.2f"),
+                "Profit Floor (₹)": st.column_config.NumberColumn("Profit Floor (₹)", format="₹%.2f"),
+                "Shares": st.column_config.NumberColumn("Shares", format="%.1f"),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # Closed Trades Section
+    st.markdown("##### 📑 Closed Trades & Performance Journal")
+    closed_pos = portfolio_mgr.state.closed_trades
+    if not closed_pos:
+        st.caption("No closed trades recorded yet.")
+    else:
+        closed_df = pd.DataFrame(closed_pos)
+        st.dataframe(
+            closed_df[[
+                "symbol", "entry_date", "exit_date", "entry_price", "exit_price",
+                "net_return_pct", "net_pnl_rs", "exit_reason", "stage_at_exit", "bars_held", "sector"
+            ]].rename(columns={
+                "symbol": "Symbol",
+                "entry_date": "Entry Date",
+                "exit_date": "Exit Date",
+                "entry_price": "Entry Price (₹)",
+                "exit_price": "Exit Price (₹)",
+                "net_return_pct": "Net Gain %",
+                "net_pnl_rs": "Net P&L (₹)",
+                "exit_reason": "Exit Reason",
+                "stage_at_exit": "Stage at Exit",
+                "bars_held": "Days Held",
+                "sector": "Sector",
+            }),
+            column_config={
+                "Entry Price (₹)": st.column_config.NumberColumn("Entry Price (₹)", format="₹%.2f"),
+                "Exit Price (₹)": st.column_config.NumberColumn("Exit Price (₹)", format="₹%.2f"),
+                "Net Gain %": st.column_config.NumberColumn("Net Gain %", format="%+.2f%%"),
+                "Net P&L (₹)": st.column_config.NumberColumn("Net P&L (₹)", format="₹%+,.2f"),
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
 
 # ----------------- TAB 1: MARKET OVERVIEW -----------------
 with tab_overview:
