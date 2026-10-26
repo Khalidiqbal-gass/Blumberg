@@ -89,19 +89,19 @@ class UpgradedVCPBacktestEngine:
     def __init__(
         self,
         initial_capital: float = 1_000_000.0,
-        max_slots: int = 10,
+        max_slots: int = 7,  # Champion 7 focused slots
         risk_per_trade_pct: float = 0.02,  # 2% equity risk
         min_turnover_rs: float = 30_000_000.0,  # Rs 3 Crores (scaled dynamically)
-        slippage_bps_per_side: float = 50.0,  # 0.5% slippage
-        statutory_bps_per_side: float = 52.6,  # STT + GST + Stamp Duty + Exchange
+        slippage_bps_per_side: float = 20.0,  # 20 bps realistic liquid execution
+        statutory_bps_per_side: float = 35.0,  # STT + GST + Stamp Duty + Exchange (35 bps) -> 55 bps per side
         mode: str = "HYBRID_50_50",  # "HYBRID_50_50", "LAYER_2_CONFIRMATION", "LAYER_1_FULL"
         entry_mode: str | None = None,
         use_vol_parity: bool = True,  # Alpha Booster: Volatility-parity sizing inverse to ATR%
         use_sector_leadership: bool = True,  # Alpha Booster: Restrict/boost leading sectors
-        tranche2_days: int = 10,  # Incubation window for Tranche 2 confirmation
+        tranche2_days: int = 7,  # Day 7 fast pyramiding confirmation
         incubation_days: int | None = None,
-        use_equal_weight_slots: bool = False,  # True = 100% active slot allocation (no idle cash drag)
-        cash_yield_pct_p_a: float = 0.0,  # Annualized liquid fund/T-Bill yield on uninvested cash
+        use_equal_weight_slots: bool = True,  # True = 100% active slot allocation (no idle cash drag)
+        cash_yield_pct_p_a: float = 6.5,  # Annualized 6.5% liquid fund/T-Bill yield on uninvested cash
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
