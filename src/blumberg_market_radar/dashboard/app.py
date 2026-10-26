@@ -411,12 +411,12 @@ with col5:
         unsafe_allow_html=True,
     )
 
-# Initialize Live Portfolio Manager (Default Rs. 10 Lakhs, 7 Slots)
-portfolio_mgr = LivePortfolioManager(initial_capital=1_000_000.0, max_slots=7)
+# Initialize Live Portfolio Manager (Default Rs. 10 Lakhs, 10 Slots)
+portfolio_mgr = LivePortfolioManager(initial_capital=1_000_000.0, max_slots=10)
 
 # Navigation Tabs (Featuring Live Model Portfolio)
 tab_portfolio, tab_overview, tab_candidates, tab_terminal, tab_events, tab_validation, tab_ml, tab_ledger, tab_health = st.tabs([
-    "💼 Live Model Portfolio (₹10L)",
+    "💼 Live Model Portfolio (₹10L - 10 Slots)",
     "🌐 Market Overview",
     "📡 Early Rally Candidates",
     "📈 Stock Detail & Footprint",
@@ -429,8 +429,8 @@ tab_portfolio, tab_overview, tab_candidates, tab_terminal, tab_events, tab_valid
 
 # ----------------- TAB 0: LIVE MODEL PORTFOLIO -----------------
 with tab_portfolio:
-    st.markdown("#### 💼 Autonomous Paper Portfolio (HYBRID_50_50 Champion Model)")
-    st.caption("Live execution engine managing ₹10 Lakhs capital with 7 equal-weight slots, 2-tranche fast pyramiding, and 5-stage dynamic floor exits.")
+    st.markdown("#### 💼 Autonomous Paper Portfolio (HYBRID_50_50 Model — 10 Slots)")
+    st.caption("Live execution engine managing ₹10 Lakhs capital with 10 equal-weight slots (10.0% target each), 2-tranche fast pyramiding, and 5-stage dynamic floor exits.")
 
     latest_close_dict = bars_df.groupby("symbol")["close"].last().to_dict() if not bars_df.empty else {}
     port_summary = portfolio_mgr.get_summary(latest_close_dict)
@@ -494,7 +494,7 @@ with tab_portfolio:
     st.markdown("---")
 
     # Active Holdings Section
-    st.markdown("##### 📈 Active Portfolio Holdings (7 Max Slots — 14.28% Allocation Each)")
+    st.markdown("##### 📈 Active Portfolio Holdings (10 Max Slots — 10.0% Allocation Each)")
     active_pos = list(portfolio_mgr.state.active_positions.values())
     if not active_pos:
         st.info("No active holdings currently in portfolio. Click '**⚡ Execute Today's Rebalance**' above to deploy capital into today's top VCP candidates!")
