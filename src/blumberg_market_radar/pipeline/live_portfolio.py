@@ -94,7 +94,7 @@ class LivePortfolioManager:
         self,
         state_path: Path | str = DEFAULT_PORTFOLIO_PATH,
         initial_capital: float = 1_000_000.0,
-        max_slots: int = 7,
+        max_slots: int = 10,
         tranche2_days: int = 7,
         slippage_bps: float = 20.0,
         statutory_bps: float = 35.0,
