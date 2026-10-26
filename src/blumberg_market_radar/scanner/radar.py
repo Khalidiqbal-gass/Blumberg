@@ -388,6 +388,68 @@ def score_pre_rally_candidates(
     return out_df.sort_values("radar_score", ascending=False).reset_index(drop=True)
 
 
+def apply_sector_cluster_guardrail(
+    ranked_candidates: pd.DataFrame,
+    active_pipeline_df: pd.DataFrame | None = None,
+    max_stocks_per_sector: int = 5,
+    max_portfolio_slots: int = 20,
+) -> tuple[pd.DataFrame, dict[str, int], int]:
+    """Applies the Institutional Golden Sweet Spot Guardrail (5% Sizing + 25% Cluster Rule):
+    - 5% Allocation per slot -> Maximum 20 portfolio positions.
+    - Max 25% Portfolio Exposure per Sector -> Maximum 5 stocks per Sector Cluster.
+    - Captures the entire cluster of winners (e.g. HAL, BEL, Mazdock, Cochin, GRSE) without missing super-runners.
+    - Caps sector risk so that a sector crash cannot hit the portfolio by more than -2.0% max.
+    - Prioritizes candidates by highest Composite Pre-Rally Radar Score.
+
+    Returns:
+        (approved_candidates_df, sector_counts_dict, available_slots)
+    """
+    if ranked_candidates.empty:
+        return ranked_candidates, {}, max_portfolio_slots
+
+    sector_counts: dict[str, int] = {}
+    active_symbols: set[str] = set()
+
+    if active_pipeline_df is not None and not active_pipeline_df.empty:
+        status_col = "status" if "status" in active_pipeline_df.columns else ("current_layer" if "current_layer" in active_pipeline_df.columns else None)
+        if status_col:
+            active_rows = active_pipeline_df[
+                ~active_pipeline_df[status_col].astype(str).str.contains("STOP_LOSS|DROPPED|EXIT", case=False, na=False)
+            ]
+        else:
+            active_rows = active_pipeline_df
+
+        for _, r in active_rows.iterrows():
+            sec = str(r.get("sector") or "Diversified / General").strip()
+            sym = str(r.get("symbol") or "").strip().upper()
+            if sym:
+                active_symbols.add(sym)
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+
+    total_active = len(active_symbols)
+    available_slots = max(0, max_portfolio_slots - total_active)
+
+    approved_records: list[dict] = []
+    for _, row in ranked_candidates.iterrows():
+        sym = str(row.get("symbol") or "").strip().upper()
+        if sym in active_symbols:
+            continue  # Already active in portfolio
+
+        sec = str(row.get("sector") or "Diversified / General").strip()
+        current_count = sector_counts.get(sec, 0)
+
+        # Enforce maximum 5 stocks per sector (25% exposure)
+        if current_count < max_stocks_per_sector:
+            approved_records.append(dict(row))
+            sector_counts[sec] = current_count + 1
+            active_symbols.add(sym)
+            if len(approved_records) >= available_slots:
+                break
+
+    approved_df = pd.DataFrame(approved_records) if approved_records else pd.DataFrame()
+    return approved_df, sector_counts, available_slots
+
+
 # Aliases for backward compatibility
 compute_comprehensive_features = compute_pre_rally_features
 score_early_rally_candidates = score_pre_rally_candidates

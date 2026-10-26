@@ -256,20 +256,43 @@ def add_candidates_to_pipeline(
     candidates_df: pd.DataFrame,
     path: Path | str = DEFAULT_PIPELINE_PATH,
     max_score_threshold: float = 35.0,
+    max_stocks_per_sector: int = 5,
+    max_portfolio_slots: int = 20,
 ) -> int:
     """Ingest newly flagged radar candidates into Layer 1 (Day 0).
     
-    Existing symbols already being tracked will not be duplicated.
+    Enforces the Golden Sweet Spot Guardrail:
+    - 5% Allocation per slot -> Maximum 20 portfolio positions.
+    - Max 25% Portfolio Exposure per Sector -> Maximum 5 stocks per Sector Cluster.
+    - Existing symbols already being tracked will not be duplicated.
     """
     if candidates_df.empty:
         return 0
 
     existing = load_staged_pipeline(path=path)
     existing_symbols = {r.symbol.upper(): r for r in existing}
+
+    # Count active holdings per sector (excluding dropped/stop-loss)
+    active_sector_counts: dict[str, int] = {}
+    active_count = 0
+    for r in existing:
+        if not any(k in r.status.upper() for k in ("STOP_LOSS", "DROPPED", "EXIT")):
+            active_count += 1
+            sec = r.sector or "Diversified / General"
+            active_sector_counts[sec] = active_sector_counts.get(sec, 0) + 1
+
+    available_slots = max(0, max_portfolio_slots - active_count)
+    if available_slots <= 0:
+        logger.info(f"Pipeline portfolio slots full ({active_count}/{max_portfolio_slots}). No new candidates added.")
+        return 0
+
     added_count = 0
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     for _, row in candidates_df.iterrows():
+        if added_count >= available_slots:
+            break
+
         sym = str(row["symbol"]).upper().replace(".NS", "").replace(".BO", "").strip()
         score = float(row.get("radar_score") or 0.0)
         if score < max_score_threshold:
@@ -278,11 +301,18 @@ def add_candidates_to_pipeline(
         if sym in existing_symbols:
             continue
 
+        sec = str(row.get("sector", "Diversified / General"))
+        current_sec_count = active_sector_counts.get(sec, 0)
+
+        # Enforce max 5 stocks per sector (25% exposure cap)
+        if current_sec_count >= max_stocks_per_sector:
+            logger.info(f"Skipping {sym}: Sector '{sec}' already has {current_sec_count}/{max_stocks_per_sector} active positions.")
+            continue
+
         close = float(row["close"])
         dt_val = row.get("date")
         dt_str = pd.to_datetime(dt_val).strftime("%Y-%m-%d") if pd.notna(dt_val) and str(dt_val) != "NaT" else today_str
         tier = str(row.get("market_cap_tier", "Tier 3: Small / Micro Cap"))
-        sec = str(row.get("sector", "Diversified / General"))
         ser = str(row.get("series", "EQ")).upper()
         reason = str(row.get("selection_reason", row.get("primary_driver", "Consolidation Base Compression")))
         has_cat = bool(row.get("has_catalyst", False))
@@ -312,11 +342,12 @@ def add_candidates_to_pipeline(
         )
         existing.append(record)
         existing_symbols[sym] = record
+        active_sector_counts[sec] = current_sec_count + 1
         added_count += 1
 
     if added_count > 0:
         save_staged_pipeline(existing, path=path)
-        logger.info(f"Added {added_count} new candidates into Layer 1 pipeline.")
+        logger.info(f"Added {added_count} new candidates into Layer 1 pipeline (5% Sizing + 25% Sector Cluster Guardrail applied).")
 
     return added_count
 

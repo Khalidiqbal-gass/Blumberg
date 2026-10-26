@@ -23,8 +23,13 @@ logger = logging.getLogger("whatsapp_alerts")
 load_dotenv()
 
 
-def format_whatsapp_digest(pipeline_df: pd.DataFrame, new_candidates_df: pd.DataFrame | None = None) -> str:
-    """Format daily EOD performance, stop-loss alerts, and new setups for WhatsApp."""
+def format_whatsapp_digest(
+    pipeline_df: pd.DataFrame,
+    new_candidates_df: pd.DataFrame | None = None,
+    sector_summary: dict[str, int] | None = None,
+    available_slots: int | None = None,
+) -> str:
+    """Format daily EOD performance, stop-loss alerts, sector allocation, and new setups for WhatsApp."""
     today_str = pd.Timestamp.now().strftime("%d %b %Y")
     lines = [
         "⚡ *BLUMBERG MARKET RADAR — EOD DIGEST*",
@@ -54,7 +59,16 @@ def format_whatsapp_digest(pipeline_df: pd.DataFrame, new_candidates_df: pd.Data
             lines.append(f"{icon} *{sym}*: ₹{price:,.1f} ({gain:+.2f}%) | Day {days}")
         lines.append("────────────────────────")
 
-    # 3. Fresh Breakout / Radar Setups
+    # 3. Sector Cluster Allocation (The Golden 5% Sizing + 25% Cluster Rule)
+    if sector_summary:
+        lines.append("🏛️ *SECTOR ALLOCATION (Max 5/Sector - 25% Cap):*")
+        for sec, cnt in sorted(sector_summary.items(), key=lambda x: x[1], reverse=True)[:5]:
+            lines.append(f"• {sec}: *{cnt}/5* ({cnt * 5}% Cap)")
+        if available_slots is not None:
+            lines.append(f"📦 *Slots Available:* {available_slots}/20 (5% each)")
+        lines.append("────────────────────────")
+
+    # 4. Fresh Breakout / Radar Setups
     if new_candidates_df is not None and not new_candidates_df.empty:
         lines.append("🎯 *TOP FRESH RADAR SETUPS (L1):*")
         top3 = new_candidates_df.head(3)
