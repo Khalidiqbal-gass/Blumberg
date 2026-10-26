@@ -95,18 +95,20 @@ class UpgradedVCPBacktestEngine:
         slippage_bps_per_side: float = 50.0,  # 0.5% slippage
         statutory_bps_per_side: float = 52.6,  # STT + GST + Stamp Duty + Exchange
         mode: str = "HYBRID_50_50",  # "HYBRID_50_50", "LAYER_2_CONFIRMATION", "LAYER_1_FULL"
+        entry_mode: str | None = None,
         use_vol_parity: bool = True,  # Alpha Booster: Volatility-parity sizing inverse to ATR%
         use_sector_leadership: bool = True,  # Alpha Booster: Restrict/boost leading sectors
         tranche2_days: int = 10,  # Incubation window for Tranche 2 confirmation
+        incubation_days: int | None = None,
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
         self.risk_per_trade_pct = risk_per_trade_pct
         self.min_turnover_rs = min_turnover_rs
-        self.mode = mode
+        self.mode = entry_mode if entry_mode is not None else mode
         self.use_vol_parity = use_vol_parity
         self.use_sector_leadership = use_sector_leadership
-        self.tranche2_days = tranche2_days
+        self.tranche2_days = incubation_days if incubation_days is not None else tranche2_days
 
         # Total cost per side = 50 + 52.6 = 102.6 bps = 0.01026
         self.cost_per_side = (slippage_bps_per_side + statutory_bps_per_side) / 10_000.0
