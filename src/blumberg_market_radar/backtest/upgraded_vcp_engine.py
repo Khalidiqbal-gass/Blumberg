@@ -101,6 +101,7 @@ class UpgradedVCPBacktestEngine:
         tranche2_days: int = 10,  # Incubation window for Tranche 2 confirmation
         incubation_days: int | None = None,
         use_equal_weight_slots: bool = False,  # True = 100% active slot allocation (no idle cash drag)
+        cash_yield_pct_p_a: float = 0.0,  # Annualized liquid fund/T-Bill yield on uninvested cash
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -111,6 +112,7 @@ class UpgradedVCPBacktestEngine:
         self.use_sector_leadership = use_sector_leadership
         self.tranche2_days = incubation_days if incubation_days is not None else tranche2_days
         self.use_equal_weight_slots = use_equal_weight_slots
+        self.cash_yield_pct_p_a = cash_yield_pct_p_a
 
         # Total cost per side = 50 + 52.6 = 102.6 bps = 0.01026
         self.cost_per_side = (slippage_bps_per_side + statutory_bps_per_side) / 10_000.0
@@ -247,8 +249,17 @@ class UpgradedVCPBacktestEngine:
         closed_trades: list[UpgradedTrade] = []
         equity_curve: list[dict[str, Any]] = []
         total_friction_paid = 0.0
+        daily_cash_yield = (
+            (1.0 + self.cash_yield_pct_p_a / 100.0) ** (1.0 / 252.0) - 1.0
+            if self.cash_yield_pct_p_a > 0.0
+            else 0.0
+        )
 
         for d_idx, cur_date in enumerate(sim_dates):
+            # Accrue overnight risk-free yield on uninvested cash (T-Bills / Liquid Funds)
+            if cash > 0.0 and daily_cash_yield > 0.0:
+                cash += cash * daily_cash_yield
+
             # -------------------------------------------------------------
             # STEP 1: MORNING MARKET OPEN (9:15 AM) - NEW ENTRIES EXECUTION
             # -------------------------------------------------------------
