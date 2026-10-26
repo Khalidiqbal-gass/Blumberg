@@ -1,13 +1,22 @@
 """Upgraded VCP & Multi-Stage Secular Backtesting Engine.
 
-Institutional-grade quantitative execution engine incorporating:
-1. True Volatility Contraction Pattern (ATR_10 < ATR_30 & Close >= 0.85 * 52W_High).
-2. Minimum Daily Turnover >= Rs. 3 Crores (30M) & 102.6 bps execution drag (50 bps slippage + 52.6 bps statutory).
-3. Benchmark Regime Filter (NIFTY 50/500 > 50 EMA or 200 EMA).
-4. Stage 1 Dynamic ATR Stop (Entry - 2.5*ATR_14 or -8% Close) + 10% Intraday Circuit Breaker + 30-Day Dead Money Time-Stop.
-5. Progressive Profit Ratchets (Stage 2: +2% floor; Stage 3: +12% / 50 EMA; Stage 4: +25% floor / 100 EMA).
-6. Stage 5 Parabolic Climax Blow-Off Exit (Close > 1.6 * 100 EMA -> 20 EMA or 15% peak drop).
-7. Cross-Sectional Ranking (RS * RVOL) & 1% Equity ATR-Based Risk Parity Position Sizing.
+Principal Quantitative Architecture incorporating:
+1. True Volatility Contraction Pattern (VCP Compression & ATR_10 < ATR_30 & Close >= 0.85 * 52W_High).
+2. Minimum Daily Turnover >= Rs. 3 Crores (with dynamic pre-2008 / pre-2016 scaling).
+3. Benchmark Regime Filter (NIFTY 50/Sensex > 50 EMA or 200 EMA).
+4. Three Configurable Entry Modes:
+   - HYBRID_50_50: 50% initial allocation at Day 0 base, 50% confirmation tranche on Day 7-10 only if in profit.
+   - LAYER_2_CONFIRMATION: 10-day incubation watchlist, 100% full allocation on Day 10 if confirmed.
+   - LAYER_1_FULL: 100% full allocation at Day 0 breakout base.
+5. Alpha Boosters:
+   - use_vol_parity: Volatility-Parity sizing inverse to ATR% to balance risk across portfolio assets.
+   - use_sector_leadership: Restricting and boosting candidates belonging to top relative strength sectors.
+6. Execution Microstructure Realism:
+   - T+1 morning cash & slot freeze (zero same-day exit capital recycling lookahead).
+   - High-before-low lookahead elimination (stops evaluated against prior day's peak price).
+   - Gap-down fill protection (fills at min(floor, open), never fake shielded max).
+   - Statutory transaction costs (STT + GST + Stamp Duty + Exchange fees + Slippage).
+7. 5-Stage Multi-Tiered Exit Engine (Defense -> Breakeven -> Ratchet -> Secular -> Climax).
 """
 from __future__ import annotations
 
@@ -26,6 +35,13 @@ class UpgradedTrade:
     shares: float
     invested_capital: float
     dollar_risk: float
+    target_slot_capital: float = 0.0
+    tranche1_invested: float = 0.0
+    tranche1_shares: float = 0.0
+    tranche2_active: bool = False
+    tranche2_eligible: bool = False
+    tranche2_date: pd.Timestamp | None = None
+    tranche2_price: float = 0.0
     exit_date: pd.Timestamp | None = None
     exit_price: float = 0.0
     exit_price_net: float = 0.0
@@ -40,6 +56,7 @@ class UpgradedTrade:
     calendar_days: int = 0
     is_climax_reached: bool = False
     status: str = "Open"
+    sector: str = ""
 
 
 @dataclass
@@ -63,23 +80,34 @@ class BacktestSummary:
     trades_df: pd.DataFrame
     equity_curve: pd.DataFrame
     yearly_summary: pd.DataFrame
+    mode: str = "HYBRID_50_50"
+    use_vol_parity: bool = True
+    use_sector_leadership: bool = True
 
 
 class UpgradedVCPBacktestEngine:
     def __init__(
         self,
         initial_capital: float = 1_000_000.0,
-        max_slots: int = 15,
-        risk_per_trade_pct: float = 0.01,  # 1% equity risk
-        min_turnover_rs: float = 30_000_000.0,  # 3 Crores
+        max_slots: int = 10,
+        risk_per_trade_pct: float = 0.02,  # 2% equity risk
+        min_turnover_rs: float = 30_000_000.0,  # Rs 3 Crores (scaled dynamically)
         slippage_bps_per_side: float = 50.0,  # 0.5% slippage
         statutory_bps_per_side: float = 52.6,  # STT + GST + Stamp Duty + Exchange
+        mode: str = "HYBRID_50_50",  # "HYBRID_50_50", "LAYER_2_CONFIRMATION", "LAYER_1_FULL"
+        use_vol_parity: bool = True,  # Alpha Booster: Volatility-parity sizing inverse to ATR%
+        use_sector_leadership: bool = True,  # Alpha Booster: Restrict/boost leading sectors
+        tranche2_days: int = 10,  # Incubation window for Tranche 2 confirmation
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
         self.risk_per_trade_pct = risk_per_trade_pct
         self.min_turnover_rs = min_turnover_rs
-        
+        self.mode = mode
+        self.use_vol_parity = use_vol_parity
+        self.use_sector_leadership = use_sector_leadership
+        self.tranche2_days = tranche2_days
+
         # Total cost per side = 50 + 52.6 = 102.6 bps = 0.01026
         self.cost_per_side = (slippage_bps_per_side + statutory_bps_per_side) / 10_000.0
 
@@ -87,14 +115,14 @@ class UpgradedVCPBacktestEngine:
     def compute_indicators(df: pd.DataFrame, bench_series: pd.Series) -> pd.DataFrame:
         """Compute True VCP, EMAs, ATRs, 52W High, and Relative Strength indicators."""
         df = df.sort_values("date").reset_index(drop=True).copy()
-        
+
         # 1. True Range & ATRs
         prev_close = df["close"].shift(1)
         tr1 = df["high"] - df["low"]
         tr2 = (df["high"] - prev_close).abs()
         tr3 = (df["low"] - prev_close).abs()
         df["tr"] = np.maximum(tr1, np.maximum(tr2, tr3))
-        
+
         df["atr_10"] = df["tr"].rolling(10, min_periods=5).mean()
         df["atr_14"] = df["tr"].rolling(14, min_periods=7).mean()
         df["atr_30"] = df["tr"].rolling(30, min_periods=15).mean()
@@ -104,8 +132,8 @@ class UpgradedVCPBacktestEngine:
         df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
         df["ema100"] = df["close"].ewm(span=100, adjust=False).mean()
 
-        # 3. 52-Week (252 Trading Days) High
-        df["high_52w"] = df["high"].rolling(252, min_periods=20).max()
+        # 3. 52-Week (252 Trading Days) High (Lookahead-free: shifted by 1)
+        df["high_52w"] = df["high"].shift(1).rolling(252, min_periods=20).max()
         df["dist_from_52w_high"] = df["close"] / df["high_52w"]
 
         # 4. Momentum & Relative Volume
@@ -126,7 +154,8 @@ class UpgradedVCPBacktestEngine:
         vcp_contraction = df["atr_10"] < df["atr_30"]
         within_15pct_52w = df["close"] >= 0.85 * df["high_52w"]
         base_consolidation = (df["ret_20d"] > 0.0) & (df["ret_20d"] <= 0.35)
-        volume_ignition = (df["ret_5d"] > 0.0) & (df["rvol"] >= 1.5)
+        volume_ignition = (df["ret_5d"] > 0.0) & (df["rvol"] >= 1.4)
+
         # Dynamic inflation/market-cap scaled liquidity floor:
         # Pre-2008: Rs 25 Lakhs | 2008-2015: Rs 1 Crore | 2016+: Rs 3 Crores
         year_s = df["date"].dt.year
@@ -148,8 +177,18 @@ class UpgradedVCPBacktestEngine:
         bench_df: pd.DataFrame,
         start_date: str | pd.Timestamp | None = None,
         end_date: str | pd.Timestamp | None = None,
+        mode: str | None = None,
     ) -> BacktestSummary:
         """Run the full event-driven multi-stage simulation with capital constraints."""
+        # 0. Mode Resolution
+        active_mode = (mode or self.mode).upper().replace("-", "_")
+        if "HYBRID" in active_mode or "50" in active_mode:
+            exec_mode = "HYBRID_50_50"
+        elif "LAYER_2" in active_mode or "L2" in active_mode or "CONFIRMATION" in active_mode:
+            exec_mode = "LAYER_2_CONFIRMATION"
+        else:
+            exec_mode = "LAYER_1_FULL"
+
         bars = bars_df.copy()
         bars["date"] = pd.to_datetime(bars["date"], utc=True)
         bench = bench_df.copy()
@@ -167,7 +206,18 @@ class UpgradedVCPBacktestEngine:
         bench_close_dict = bench.set_index("date")["close"].to_dict()
         bench_series = bench.set_index("date")["close"]
 
-        # 2. Compute Indicators per Symbol
+        # 2. Sector Leadership Pre-computation (Alpha Booster 2)
+        sector_rs_dict: dict[tuple[pd.Timestamp, str], float] = {}
+        if "sector" in bars.columns and self.use_sector_leadership:
+            bars_sorted = bars.sort_values(["symbol", "date"]).reset_index(drop=True)
+            bars_sorted["_ret20"] = bars_sorted.groupby("symbol")["close"].pct_change(20)
+            sector_means = bars_sorted.groupby(["date", "sector"])["_ret20"].mean().reset_index()
+            bench_20d = bench.set_index("date")["close"].pct_change(20)
+            sector_means["bench_20d"] = sector_means["date"].map(bench_20d).fillna(0.0)
+            sector_means["sector_rs"] = sector_means["_ret20"] - sector_means["bench_20d"]
+            sector_rs_dict = sector_means.set_index(["date", "sector"])["sector_rs"].to_dict()
+
+        # 3. Compute Indicators per Symbol
         symbol_data: dict[str, pd.DataFrame] = {}
         all_dates_set = set()
         for sym, grp in bars.groupby("symbol"):
@@ -186,9 +236,10 @@ class UpgradedVCPBacktestEngine:
         if not sim_dates:
             sim_dates = all_dates
 
-        # 3. Simulation State (Senior Quant Hardened: No Lookahead, Real Cash Settlement)
+        # 4. Simulation State (Senior Quant Hardened: No Lookahead, Real Cash Settlement)
         cash = self.initial_capital
         active_trades: dict[str, UpgradedTrade] = {}
+        watchlist_l2: dict[str, dict[str, Any]] = {}
         closed_trades: list[UpgradedTrade] = []
         equity_curve: list[dict[str, Any]] = []
         total_friction_paid = 0.0
@@ -205,86 +256,225 @@ class UpgradedVCPBacktestEngine:
             available_slots = max(0, self.max_slots - len(existing_symbols))
 
             orig_idx = date_to_idx.get(cur_date, 0)
-            if orig_idx > 0 and available_slots > 0 and available_cash_for_entry >= 10_000.0:
-                prev_date = all_dates[orig_idx - 1]
-                regime_ok = bench_regime_dict.get(prev_date, True)
+            prev_date = all_dates[orig_idx - 1] if orig_idx > 0 else None
+            regime_ok = bench_regime_dict.get(prev_date, True) if prev_date is not None else True
 
-                if regime_ok:
-                    candidates: list[dict[str, Any]] = []
-                    for sym, s_df in symbol_data.items():
-                        if sym in active_trades:
-                            continue
-                        if prev_date in s_df.index and s_df.loc[prev_date, "raw_signal"]:
-                            p_row = s_df.loc[prev_date]
-                            candidates.append({
-                                "symbol": sym,
-                                "rs_score": p_row["rs_score"],
-                                "rvol": p_row["rvol"],
-                                "atr_14": p_row["atr_14"],
-                            })
+            # Portfolio Mark-to-Market Equity at Open
+            mtm_val_open = sum(
+                symbol_data[s].loc[cur_date]["open"] * t.shares
+                if cur_date in symbol_data[s].index else t.invested_capital
+                for s, t in active_trades.items()
+            )
+            current_equity_open = cash + mtm_val_open
+            max_slot_capital = current_equity_open / self.max_slots
 
-                    # Cross-Sectional Ranking: Sort by RS * RVOL Score Descending
-                    candidates.sort(key=lambda x: x["rs_score"], reverse=True)
-
-                    for cand in candidates:
-                        if available_slots <= 0 or available_cash_for_entry < 10_000.0:
-                            break
-
-                        sym = cand["symbol"]
+            # ---------------------------------------------------------
+            # A. Process Tranche 2 Additions for HYBRID_50_50 at Open
+            # ---------------------------------------------------------
+            if exec_mode == "HYBRID_50_50":
+                for sym in existing_symbols:
+                    tr = active_trades[sym]
+                    if tr.tranche2_eligible and not tr.tranche2_active:
+                        tr.tranche2_eligible = False
                         s_df = symbol_data[sym]
-                        if cur_date not in s_df.index:
+                        if cur_date in s_df.index:
+                            bar = s_df.loc[cur_date]
+                            # Upper circuit check
+                            if not (bar["open"] == bar["high"] and bar["high"] == bar["low"]):
+                                t2_alloc = min(available_cash_for_entry, tr.target_slot_capital * 0.5)
+                                if t2_alloc >= 2500.0:
+                                    raw_t2 = bar["open"]
+                                    t2_friction = t2_alloc * self.cost_per_side
+                                    total_friction_paid += t2_friction
+                                    t2_shares = (t2_alloc - t2_friction) / raw_t2
+
+                                    cash -= t2_alloc
+                                    available_cash_for_entry -= t2_alloc
+
+                                    tr.shares += t2_shares
+                                    tr.invested_capital += t2_alloc
+                                    tr.entry_price = tr.invested_capital / tr.shares  # Blended entry
+                                    tr.entry_price_with_friction = tr.entry_price * (1.0 + self.cost_per_side)
+                                    tr.tranche2_active = True
+                                    tr.tranche2_date = cur_date
+                                    tr.tranche2_price = raw_t2
+
+            # ---------------------------------------------------------
+            # B. Process LAYER_2_CONFIRMATION Watchlist Graduations at Open
+            # ---------------------------------------------------------
+            if exec_mode == "LAYER_2_CONFIRMATION":
+                graduated_syms: list[str] = []
+                for sym, w in list(watchlist_l2.items()):
+                    if sym in active_trades:
+                        graduated_syms.append(sym)
+                        continue
+                    if w.get("graduated", False) and available_slots > 0 and available_cash_for_entry >= 5000.0 and regime_ok:
+                        s_df = symbol_data[sym]
+                        if cur_date in s_df.index:
+                            bar = s_df.loc[cur_date]
+                            if not (bar["open"] == bar["high"] and bar["high"] == bar["low"]):
+                                alloc_capital = min(w["target_capital"], max_slot_capital, available_cash_for_entry)
+                                if alloc_capital >= 5000.0:
+                                    raw_entry = bar["open"]
+                                    entry_friction = alloc_capital * self.cost_per_side
+                                    total_friction_paid += entry_friction
+                                    shares = (alloc_capital - entry_friction) / raw_entry
+
+                                    cash -= alloc_capital
+                                    available_cash_for_entry -= alloc_capital
+                                    available_slots -= 1
+
+                                    active_trades[sym] = UpgradedTrade(
+                                        symbol=sym,
+                                        entry_date=cur_date,
+                                        entry_price=raw_entry,
+                                        entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
+                                        shares=shares,
+                                        invested_capital=alloc_capital,
+                                        dollar_risk=w["dollar_risk"],
+                                        target_slot_capital=w["target_capital"],
+                                        tranche1_invested=alloc_capital,
+                                        tranche1_shares=shares,
+                                        tranche2_active=True,
+                                        peak_price=raw_entry,
+                                        status="Open",
+                                    )
+                                    graduated_syms.append(sym)
+                for sym in graduated_syms:
+                    if sym in watchlist_l2:
+                        del watchlist_l2[sym]
+
+            # ---------------------------------------------------------
+            # C. Process New Signals from prev_date
+            # ---------------------------------------------------------
+            if orig_idx > 0 and regime_ok:
+                candidates: list[dict[str, Any]] = []
+                for sym, s_df in symbol_data.items():
+                    if sym in active_trades or sym in watchlist_l2:
+                        continue
+                    if prev_date in s_df.index and s_df.loc[prev_date, "raw_signal"]:
+                        p_row = s_df.loc[prev_date]
+                        cand_sec = str(p_row.get("sector", "")) if "sector" in p_row.index else ""
+                        sec_rs = sector_rs_dict.get((prev_date, cand_sec), 0.0)
+
+                        rank_score = float(p_row["rs_score"])
+                        if self.use_sector_leadership and "sector" in bars.columns:
+                            if sec_rs > 0.0:
+                                rank_score *= 1.25  # Leadership boost
+                            elif sec_rs < -0.05:
+                                rank_score *= 0.75  # Laggard discount
+
+                        candidates.append({
+                            "symbol": sym,
+                            "rs_score": float(p_row["rs_score"]),
+                            "rvol": float(p_row["rvol"]),
+                            "atr_14": float(p_row["atr_14"]) if pd.notnull(p_row["atr_14"]) else 0.0,
+                            "sector": cand_sec,
+                            "sector_rs": sec_rs,
+                            "rank_score": rank_score,
+                        })
+
+                # Cross-Sectional Ranking: Rank by score descending
+                candidates.sort(key=lambda x: x["rank_score"], reverse=True)
+
+                for cand in candidates:
+                    sym = cand["symbol"]
+                    s_df = symbol_data[sym]
+                    if cur_date not in s_df.index:
+                        continue
+                    bar = s_df.loc[cur_date]
+
+                    # Upper Circuit Rejection: open == high == low
+                    if bar["open"] == bar["high"] and bar["high"] == bar["low"]:
+                        continue
+
+                    # Sizing: Volatility-Parity vs Standard Risk Parity (Alpha Booster 1)
+                    dollar_risk = current_equity_open * self.risk_per_trade_pct
+                    atr_val = cand["atr_14"] if cand["atr_14"] > 0 else bar["open"] * 0.03
+                    unit_risk = max(bar["open"] * 0.08, 2.5 * atr_val)
+                    target_shares = dollar_risk / unit_risk
+
+                    if self.use_vol_parity:
+                        atr_pct = max(0.01, atr_val / bar["open"])
+                        vol_scale = np.clip(0.03 / atr_pct, 0.5, 1.5)
+                        target_capital = min(target_shares * bar["open"] * vol_scale, max_slot_capital)
+                    else:
+                        target_capital = min(target_shares * bar["open"], max_slot_capital)
+
+                    if exec_mode == "LAYER_1_FULL":
+                        if available_slots <= 0 or available_cash_for_entry < 5000.0:
+                            break
+                        alloc_capital = min(target_capital, available_cash_for_entry)
+                        if alloc_capital < 5000.0:
                             continue
-                        bar = s_df.loc[cur_date]
-
-                        # Upper Circuit Rejection: open == high == low
-                        if bar["open"] == bar["high"] and bar["high"] == bar["low"]:
-                            continue
-
-                        # Calculate Total Current Portfolio Equity at Open
-                        mtm_val_open = sum(
-                            symbol_data[s].loc[cur_date]["open"] * t.shares
-                            if cur_date in symbol_data[s].index else t.invested_capital
-                            for s, t in active_trades.items()
-                        )
-                        current_equity_open = cash + mtm_val_open
-
-                        # 1% Equity Risk Parity Sizing
-                        dollar_risk = current_equity_open * self.risk_per_trade_pct
-                        atr_val = cand["atr_14"] if pd.notnull(cand["atr_14"]) else bar["open"] * 0.03
-                        unit_risk = max(bar["open"] * 0.08, 2.5 * atr_val)
-                        target_shares = dollar_risk / unit_risk
-                        target_capital = target_shares * bar["open"]
-
-                        # Cap at max slot allocation (e.g. 1/15th of equity)
-                        max_slot_capital = current_equity_open / self.max_slots
-                        alloc_capital = min(target_capital, max_slot_capital, available_cash_for_entry)
-
-                        if alloc_capital < 10_000.0 or available_cash_for_entry < alloc_capital:
-                            continue
-
-                        # Execute Entry at Open with Friction
                         raw_entry = bar["open"]
                         entry_friction = alloc_capital * self.cost_per_side
                         total_friction_paid += entry_friction
-                        actual_invest = alloc_capital - entry_friction
-                        shares = actual_invest / raw_entry
+                        shares = (alloc_capital - entry_friction) / raw_entry
 
                         cash -= alloc_capital
                         available_cash_for_entry -= alloc_capital
                         available_slots -= 1
 
-                        entry_price_with_friction = raw_entry * (1.0 + self.cost_per_side)
+                        active_trades[sym] = UpgradedTrade(
+                            symbol=sym,
+                            entry_date=cur_date,
+                            entry_price=raw_entry,
+                            entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
+                            shares=shares,
+                            invested_capital=alloc_capital,
+                            dollar_risk=dollar_risk,
+                            target_slot_capital=target_capital,
+                            tranche1_invested=alloc_capital,
+                            tranche1_shares=shares,
+                            tranche2_active=True,
+                            peak_price=raw_entry,
+                            status="Open",
+                        )
+
+                    elif exec_mode == "HYBRID_50_50":
+                        if available_slots <= 0 or available_cash_for_entry < 2500.0:
+                            break
+                        alloc_capital = min(target_capital * 0.5, available_cash_for_entry)
+                        if alloc_capital < 2500.0:
+                            continue
+                        raw_entry = bar["open"]
+                        entry_friction = alloc_capital * self.cost_per_side
+                        total_friction_paid += entry_friction
+                        shares = (alloc_capital - entry_friction) / raw_entry
+
+                        cash -= alloc_capital
+                        available_cash_for_entry -= alloc_capital
+                        available_slots -= 1
 
                         active_trades[sym] = UpgradedTrade(
                             symbol=sym,
                             entry_date=cur_date,
                             entry_price=raw_entry,
-                            entry_price_with_friction=entry_price_with_friction,
+                            entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
                             shares=shares,
                             invested_capital=alloc_capital,
                             dollar_risk=dollar_risk,
+                            target_slot_capital=target_capital,
+                            tranche1_invested=alloc_capital,
+                            tranche1_shares=shares,
+                            tranche2_active=False,
+                            tranche2_eligible=False,
                             peak_price=raw_entry,
+                            status="Open",
                         )
+
+                    elif exec_mode == "LAYER_2_CONFIRMATION":
+                        if sym not in watchlist_l2:
+                            watchlist_l2[sym] = {
+                                "discovery_date": cur_date,
+                                "discovery_price": bar["open"],
+                                "days": 0,
+                                "max_low": bar["low"],
+                                "target_capital": target_capital,
+                                "dollar_risk": dollar_risk,
+                                "graduated": False,
+                            }
 
             # -------------------------------------------------------------
             # STEP 2: INTRADAY & CLOSING POSITION MANAGEMENT (EXITS)
@@ -312,6 +502,11 @@ class UpgradedVCPBacktestEngine:
                 exit_price = 0.0
                 exit_reason = ""
                 stage_name = ""
+
+                # Check Tranche 2 eligibility for tomorrow in HYBRID_50_50
+                if exec_mode == "HYBRID_50_50" and not tr.tranche2_active and tr.bars_held >= (self.tranche2_days - 1):
+                    if bar["close"] > tr.entry_price and bar["low"] > tr.entry_price * 0.92:
+                        tr.tranche2_eligible = True
 
                 # -------------------------------------------------------------
                 # STAGE 5: PARABOLIC CLIMAX EXIT (Blow-off Top check)
@@ -436,6 +631,29 @@ class UpgradedVCPBacktestEngine:
                         if b["high"] > tr.peak_price:
                             tr.peak_price = b["high"]
 
+            # Update Watchlist incubation in LAYER_2_CONFIRMATION
+            if exec_mode == "LAYER_2_CONFIRMATION":
+                expired_w: list[str] = []
+                for sym, w in list(watchlist_l2.items()):
+                    if sym in active_trades:
+                        expired_w.append(sym)
+                        continue
+                    s_df = symbol_data[sym]
+                    if cur_date not in s_df.index:
+                        continue
+                    b = s_df.loc[cur_date]
+                    w["days"] += 1
+                    w["max_low"] = min(w["max_low"], float(b["low"]))
+                    if w["days"] >= self.tranche2_days:
+                        c_close = float(b["close"])
+                        if c_close > w["discovery_price"] and w["max_low"] > w["discovery_price"] * 0.92:
+                            w["graduated"] = True
+                        else:
+                            expired_w.append(sym)
+                for sym in expired_w:
+                    if sym in watchlist_l2:
+                        del watchlist_l2[sym]
+
             # -------------------------------------------------------------
             # STEP 3: DAILY PORTFOLIO MARK-TO-MARKET VALUATION
             # -------------------------------------------------------------
@@ -474,7 +692,7 @@ class UpgradedVCPBacktestEngine:
             tr.status = "Active"
             closed_trades.append(tr)
 
-        # 4. Generate Performance DataFrames & Statistics
+        # 5. Generate Performance DataFrames & Statistics
         if closed_trades:
             trades_df = pd.DataFrame([vars(t) for t in closed_trades])
         else:
@@ -538,8 +756,9 @@ class UpgradedVCPBacktestEngine:
             yr_end_cap = grp.iloc[-1]["total_equity"]
             yr_model_ret = (yr_end_cap / prev_cap - 1.0) * 100.0
 
-            yr_nifty_end = grp["nifty_close"].dropna().iloc[-1]
-            yr_nifty_ret = (yr_nifty_end / prev_nifty - 1.0) * 100.0
+            nifty_pts = grp["nifty_close"].dropna()
+            yr_nifty_end = nifty_pts.iloc[-1] if not nifty_pts.empty else prev_nifty
+            yr_nifty_ret = (yr_nifty_end / prev_nifty - 1.0) * 100.0 if prev_nifty > 0 else 0.0
 
             yearly_rows.append({
                 "year": yr,
@@ -576,4 +795,7 @@ class UpgradedVCPBacktestEngine:
             trades_df=trades_df,
             equity_curve=eq_df,
             yearly_summary=yearly_df,
+            mode=exec_mode,
+            use_vol_parity=self.use_vol_parity,
+            use_sector_leadership=self.use_sector_leadership,
         )

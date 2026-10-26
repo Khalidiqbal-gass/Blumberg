@@ -100,13 +100,10 @@ def compute_pre_rally_features(
         # Compression ratio: values < 0.60 indicate strong consolidation base
         df["range_compression_ratio"] = (range_20d / range_60d.replace(0, np.nan)).clip(0.1, 1.5)
 
-        # 5. Distance to 52-Week High (250 sessions)
-        # 5. Distance to 52-Week High (250 sessions - shifted by 1 to prevent lookahead)
-        roll_250_high = h.shift(1).rolling(250, min_periods=20).max()
-        df["high_52w"] = roll_250_high
-        df["dist_to_52w_high_pct"] = (c / roll_250_high - 1.0) * 100.0
-
-        # Fresh 20-day consolidation breakout flag
+        # 5. Distance to 52-Week High (252 sessions - shifted by 1 to prevent lookahead)
+        roll_252_high = h.shift(1).rolling(252, min_periods=20).max()
+        df["high_52w"] = roll_252_high
+        df["dist_to_52w_high_pct"] = (c / roll_252_high - 1.0) * 100.0
         df["is_breakout_20d"] = c > roll_20_high
 
         # 6. Daily Traded Value / Liquidity (Turnover in ₹ Crores)
@@ -231,7 +228,8 @@ def score_pre_rally_candidates(
                     ev_dates = ev_dates.dt.tz_localize(None)
 
                 # Active within last 120 days before or on candle date
-                valid_events = sym_events[(ev_dates <= curr_date) & ((curr_date - ev_dates).dt.days <= 120)]
+                if pd.notna(curr_date) and not ev_dates.isna().all():
+                    valid_events = sym_events[(ev_dates <= curr_date) & ((curr_date - ev_dates).dt.days <= 120)]
                 if not valid_events.empty:
                     ev = valid_events.iloc[0]
                     has_catalyst = True
