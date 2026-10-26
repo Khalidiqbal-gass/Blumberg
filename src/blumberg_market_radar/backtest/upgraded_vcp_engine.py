@@ -100,6 +100,7 @@ class UpgradedVCPBacktestEngine:
         use_sector_leadership: bool = True,  # Alpha Booster: Restrict/boost leading sectors
         tranche2_days: int = 10,  # Incubation window for Tranche 2 confirmation
         incubation_days: int | None = None,
+        use_equal_weight_slots: bool = False,  # True = 100% active slot allocation (no idle cash drag)
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -109,6 +110,7 @@ class UpgradedVCPBacktestEngine:
         self.use_vol_parity = use_vol_parity
         self.use_sector_leadership = use_sector_leadership
         self.tranche2_days = incubation_days if incubation_days is not None else tranche2_days
+        self.use_equal_weight_slots = use_equal_weight_slots
 
         # Total cost per side = 50 + 52.6 = 102.6 bps = 0.01026
         self.cost_per_side = (slippage_bps_per_side + statutory_bps_per_side) / 10_000.0
@@ -390,18 +392,22 @@ class UpgradedVCPBacktestEngine:
                     if bar["open"] == bar["high"] and bar["high"] == bar["low"]:
                         continue
 
-                    # Sizing: Volatility-Parity vs Standard Risk Parity (Alpha Booster 1)
-                    dollar_risk = current_equity_open * self.risk_per_trade_pct
-                    atr_val = cand["atr_14"] if cand["atr_14"] > 0 else bar["open"] * 0.03
-                    unit_risk = max(bar["open"] * 0.08, 2.5 * atr_val)
-                    target_shares = dollar_risk / unit_risk
-
-                    if self.use_vol_parity:
-                        atr_pct = max(0.01, atr_val / bar["open"])
-                        vol_scale = np.clip(0.03 / atr_pct, 0.5, 1.5)
-                        target_capital = min(target_shares * bar["open"] * vol_scale, max_slot_capital)
+                    # Sizing: Equal-Weight Slots (Zero Idle Cash) vs Risk Parity (Alpha Booster 1)
+                    if self.use_equal_weight_slots:
+                        target_capital = max_slot_capital
+                        dollar_risk = max_slot_capital * 0.08
                     else:
-                        target_capital = min(target_shares * bar["open"], max_slot_capital)
+                        dollar_risk = current_equity_open * self.risk_per_trade_pct
+                        atr_val = cand["atr_14"] if cand["atr_14"] > 0 else bar["open"] * 0.03
+                        unit_risk = max(bar["open"] * 0.08, 2.5 * atr_val)
+                        target_shares = dollar_risk / unit_risk
+
+                        if self.use_vol_parity:
+                            atr_pct = max(0.01, atr_val / bar["open"])
+                            vol_scale = np.clip(0.03 / atr_pct, 0.5, 1.5)
+                            target_capital = min(target_shares * bar["open"] * vol_scale, max_slot_capital)
+                        else:
+                            target_capital = min(target_shares * bar["open"], max_slot_capital)
 
                     if exec_mode == "LAYER_1_FULL":
                         if available_slots <= 0 or available_cash_for_entry < 5000.0:
