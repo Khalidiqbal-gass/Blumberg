@@ -216,6 +216,7 @@ def score_pre_rally_candidates(
         has_catalyst = False
         catalyst_desc = ""
         catalyst_order_val = None
+        valid_events = pd.DataFrame()
         if events_df is not None and not events_df.empty:
             sym_events = events_df[(events_df["symbol"] == clean_sym) | (events_df["symbol"] == sym)]
             if not sym_events.empty:

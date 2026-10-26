@@ -1,0 +1,5 @@
+Scenario,Slippage_Bps,Statutory_Bps,Total_Bps_Per_Side,CAGR_Pct,Max_Drawdown_Pct,Final_Capital_Rs,Multiple,Total_Friction_Paid_Rs
+Liquid Baseline (20 bps slip + 35 bps tax = 55 bps side),20.0,35.0,55.0,22.82,-28.1,247141556.69,247.14,44939724.83
+Medium Impact (40 bps slip + 35 bps tax = 75 bps side),40.0,35.0,75.0,19.86,-27.34,128378133.55,128.38,39914637.06
+High Small-Cap Friction (65 bps slip + 35 bps tax = 100 bps side),65.0,35.0,100.0,20.2,-34.01,138442825.14,138.44,64630664.89
+Punishing Friction (100 bps slip + 52.6 bps tax = 152.6 bps side),100.0,52.6,152.6,16.47,-96.57,59561123.15,59.56,54301716.5
