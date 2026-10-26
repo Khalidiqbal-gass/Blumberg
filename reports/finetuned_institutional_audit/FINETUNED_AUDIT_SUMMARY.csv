@@ -1,0 +1,4 @@
+Configuration,Entry_Mode,Total_Trades,Win_Rate_Pct,Net_CAGR_Pct,Max_Drawdown_Pct,Profit_Factor,Final_Capital_Rs,Total_Friction_Paid_Rs
+HYBRID_50_50 (Fine-Tuned Institutional),HYBRID_50_50,877,38.77,16.0,-37.86,2.58,53427279.65,10392866.49
+LAYER_2_CONFIRMATION (Low-Risk 10d Incubation),LAYER_2_CONFIRMATION,804,43.28,12.39,-59.74,1.78,22877288.69,7014527.83
+LAYER_1_FULL (Aggressive Day 0 Entry),LAYER_1_FULL,749,43.39,17.5,-46.88,2.22,75375111.65,16070403.12
