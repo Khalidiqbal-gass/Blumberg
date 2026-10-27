@@ -1,0 +1,2 @@
+Metric,Worst_Case_5th_CAGR_%,Median_50th_CAGR_%,Best_Case_95th_CAGR_%,Worst_Case_5th_MaxDD_%,Median_50th_MaxDD_%,Best_Case_95th_MaxDD_%,Worst_Case_Final_Capital_Rs,Median_Final_Capital_Rs,Best_Case_Final_Capital_Rs
+"10-Slot Monte Carlo 1,000 Runs",7.7,14.08,21.53,-38.17,-25.55,-17.32,7299574.23,34099139.44,185945420.57
