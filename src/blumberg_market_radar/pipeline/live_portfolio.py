@@ -214,6 +214,7 @@ class LivePortfolioManager:
         """Run complete daily decision cycle (Exits -> Tranche 2 -> New Entries -> MTM)."""
         today_date = current_date_str or datetime.now().strftime("%Y-%m-%d")
         actions_taken = []
+        is_same_day_rerun = (self.state.last_rebalance_date == today_date)
 
         # 1. Benchmark Regime Check
         regime_ok = True
@@ -225,9 +226,10 @@ class LivePortfolioManager:
                 bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1] if len(bench_sorted) >= 200 else bench_ema50
                 regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
 
-        # Accrue daily cash yield
-        daily_yield_rs = self.state.cash * self.cash_yield_daily
-        self.state.cash += daily_yield_rs
+        # Accrue daily cash yield (Only once per calendar day)
+        if not is_same_day_rerun:
+            daily_yield_rs = self.state.cash * self.cash_yield_daily
+            self.state.cash += daily_yield_rs
 
         # Get latest bar mapping for all symbols
         bars_latest = bars_df.sort_values("date").groupby("symbol").last()
@@ -235,7 +237,8 @@ class LivePortfolioManager:
         # Step A: Evaluate Exits for Active Trades
         symbols_to_close = []
         for sym, pos in list(self.state.active_positions.items()):
-            pos["bars_held"] = pos.get("bars_held", 0) + 1
+            if not is_same_day_rerun:
+                pos["bars_held"] = pos.get("bars_held", 0) + 1
             if sym not in bars_latest.index:
                 continue
 
@@ -264,8 +267,8 @@ class LivePortfolioManager:
                     exit_price = min(floor_price, open_p)
                     exit_reason = f"Climax Profit Floor Breached (-25% from Peak ₹{prior_peak:.2f})"
 
-            # ---------------- STAGE 4: SECULAR COMPOUNDER (+60% <= Peak < +100%) ----------------
-            elif 60.0 <= gain_from_entry < 100.0:
+            # ---------------- STAGE 4: SECULAR COMPOUNDER (+50% <= Peak < +100%) ----------------
+            elif 50.0 <= gain_from_entry < 100.0:
                 stage_name = "Stage 4: Secular Compounding"
                 floor_4 = entry_p * 1.25
                 pos["profit_floor_price"] = floor_4
@@ -274,8 +277,8 @@ class LivePortfolioManager:
                     exit_price = min(floor_4, open_p)
                     exit_reason = "Secular Profit Floor (+25% Floor Protected)"
 
-            # ---------------- STAGE 3: TREND ACCELERATION (+30% <= Peak < +60%) ----------------
-            elif 30.0 <= gain_from_entry < 60.0:
+            # ---------------- STAGE 3: TREND ACCELERATION (+30% <= Peak < +50%) ----------------
+            elif 30.0 <= gain_from_entry < 50.0:
                 stage_name = "Stage 3: Trend Momentum"
                 floor_12 = entry_p * 1.12
                 pos["profit_floor_price"] = floor_12
@@ -301,7 +304,14 @@ class LivePortfolioManager:
                 closing_stop = entry_p * 0.92
                 pos["stop_loss_price"] = closing_stop
 
-                if low_p <= hard_stop:
+                # Demerger / Corporate Action anomaly check: If single-day drop exceeds 35% without volume explosion,
+                # do not execute panic exit on unadjusted corporate action (e.g. demerger like VEDL).
+                is_corp_action_anomaly = (low_p <= entry_p * 0.65) and (prior_peak >= entry_p * 0.95)
+
+                if is_corp_action_anomaly:
+                    logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
+                    actions_taken.append(f"⚠️ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Automated exit halted for audit.")
+                elif low_p <= hard_stop:
                     exit_triggered = True
                     exit_price = min(hard_stop, open_p)
                     exit_reason = "Extreme Circuit Breaker (-10% Hard Stop)"
@@ -310,9 +320,11 @@ class LivePortfolioManager:
                     exit_price = min(closing_stop, open_p) if open_p < closing_stop else close_p
                     exit_reason = "Closing Stop-Loss (-8% Threshold)"
                 elif pos["bars_held"] >= 30 and (close_p / entry_p - 1.0) < 0.10:
-                    exit_triggered = True
-                    exit_price = close_p
-                    exit_reason = "Dead Money Time-Stop Exit (30d Stagnant Base)"
+                    ema20_val = float(bar["ema20"]) if "ema20" in bar and pd.notna(bar["ema20"]) else None
+                    if ema20_val is None or close_p < ema20_val:
+                        exit_triggered = True
+                        exit_price = close_p
+                        exit_reason = "Dead Money Time-Stop Exit (30d Stagnant Base & Below 20 EMA)"
 
             pos["current_stage"] = stage_name
             pos["current_price"] = close_p
@@ -372,7 +384,7 @@ class LivePortfolioManager:
                             pos["shares"] += t2_shares
                             pos["invested_capital"] += t2_alloc
                             pos["entry_price"] = pos["invested_capital"] / pos["shares"]
-                            pos["entry_price_with_friction"] = pos["entry_price"] * (1.0 + self.cost_per_side)
+                            pos["entry_price_with_friction"] = pos["invested_capital"] / pos["shares"]
                             pos["tranche2_active"] = True
                             pos["tranche2_date"] = today_date
                             pos["tranche2_shares"] = t2_shares

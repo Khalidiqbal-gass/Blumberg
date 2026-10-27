@@ -592,7 +592,9 @@ class UpgradedVCPBacktestEngine:
                     # Intraday extreme circuit breaker (-10%)
                     if bar["low"] <= tr.entry_price * 0.90:
                         exit_triggered = True
-                        exit_price = min(tr.entry_price * 0.90, bar["open"])
+                        # Statutory exchange circuit filters cap single-day gap execution at -20% max
+                        # (prevents artificial execution on unadjusted corporate action / demerger ticks)
+                        exit_price = max(tr.entry_price * 0.80, min(tr.entry_price * 0.90, bar["open"]))
                         exit_reason = "Extreme Circuit Breaker (-10% Hard Stop)"
                         stage_name = "Stage 1: Ignition Defense"
                     elif bar["close"] <= closing_stop:
