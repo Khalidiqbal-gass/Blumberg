@@ -24,7 +24,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from blumberg_market_radar.data.ingestion import fetch_historical_ohlcv, fetch_benchmark
-from blumberg_market_radar.scanner.radar import compute_pre_rally_features, score_pre_rally_candidates
+from blumberg_market_radar.scanner.radar import (
+    compute_pre_rally_features,
+    score_pre_rally_candidates,
+    apply_sector_cluster_guardrail,
+)
 from blumberg_market_radar.pipeline.live_portfolio import LivePortfolioManager
 
 DATA_DIR = PROJECT_ROOT / "data"
@@ -33,10 +37,23 @@ HISTORICAL_DIR = DATA_DIR / "cache" / "historical_2000_2026"
 CACHE_MARKET = DATA_DIR / "cache" / "market_eod_all_equities.parquet"
 
 
-def run_daily_autonomous_trader(enforce_regime: bool = True, initial_capital: float = 1_000_000.0) -> None:
+def run_daily_autonomous_trader(
+    enforce_regime: bool = True,
+    initial_capital: float = 1_000_000.0,
+    sync_live: bool = False,
+) -> None:
     print("=" * 100)
     print("   BLUMBERG AUTONOMOUS MODEL TRADER — HYBRID_50_50 CHAMPION REBALANCE")
     print("=" * 100)
+
+    # 0. Sync fresh live EOD data if requested
+    if sync_live:
+        print("[INFO] Fetching fresh live market bars before daily rebalance...")
+        try:
+            from scripts.sync_today_pipeline_bars import sync_today
+            sync_today()
+        except Exception as exc:
+            print(f"[WARNING] Live sync encountered: {exc}. Proceeding with latest cached data.")
 
     # 1. Load Market Data
     if (HISTORICAL_DIR / "market_bars_with_delisted_2000_2026.parquet").exists():
@@ -76,12 +93,22 @@ def run_daily_autonomous_trader(enforce_regime: bool = True, initial_capital: fl
         statutory_bps=35.0,
     )
 
-    # 4. Execute Autonomous Daily Rebalance
+    # 4. Apply Sector Concentration Guardrail (Max 2 stocks per sector in 8-slot model = 25% sector cap)
+    active_df = pd.DataFrame(list(mgr.state.active_positions.values()))
+    approved_candidates, sector_counts, free_slots = apply_sector_cluster_guardrail(
+        ranked_clean,
+        active_pipeline_df=active_df,
+        max_stocks_per_sector=2,
+        max_portfolio_slots=8,
+    )
+    print(f"Sector guardrail applied: {len(approved_candidates)} candidates approved (Active sector exposures: {sector_counts}).")
+
+    # 5. Execute Autonomous Daily Rebalance
     cur_date_str = max_dt.strftime("%Y-%m-%d")
     res = mgr.execute_daily_rebalance(
         bars_df=recent_bars,
         bench_df=recent_bench,
-        candidates_df=ranked_clean,
+        candidates_df=approved_candidates,
         current_date_str=cur_date_str,
         enforce_regime=enforce_regime,
     )
@@ -133,6 +160,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--capital", type=float, default=1_000_000.0, help="Initial capital in Rupees")
     parser.add_argument("--no-regime", action="store_true", help="Bypass benchmark regime filter")
+    parser.add_argument("--sync-live", action="store_true", help="Fetch fresh live market bars before rebalance")
     args = parser.parse_args()
 
-    run_daily_autonomous_trader(enforce_regime=not args.no_regime, initial_capital=args.capital)
+    run_daily_autonomous_trader(
+        enforce_regime=not args.no_regime,
+        initial_capital=args.capital,
+        sync_live=args.sync_live,
+    )
