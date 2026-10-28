@@ -332,7 +332,16 @@ class LivePortfolioManager:
             pos["unrealized_pnl_rs"] = (close_p * pos["shares"]) - pos["invested_capital"]
 
             if exit_triggered:
-                symbols_to_close.append((sym, exit_price, exit_reason, stage_name))
+                # Lower circuit check: if stock is locked limit-down, cannot sell today
+                is_lower_circuit = (low_p == high_p) or ((open_p == low_p) and (close_p <= open_p))
+                if is_lower_circuit and "Dead Money" not in exit_reason:
+                    pos["current_stage"] = f"PENDING: {exit_reason} (Lower Circuit - Deferred)"
+                    actions_taken.append(f"⚠️ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
+                    if high_p > prior_peak:
+                        pos["peak_price"] = high_p
+                        pos["peak_gain_pct"] = (high_p / entry_p - 1.0) * 100.0
+                else:
+                    symbols_to_close.append((sym, exit_price, exit_reason, stage_name))
             else:
                 # Update peak only if trade survived session
                 if high_p > prior_peak:
@@ -372,7 +381,11 @@ class LivePortfolioManager:
         for sym, pos in list(self.state.active_positions.items()):
             if not pos.get("tranche2_active", False) and pos.get("bars_held", 0) >= self.tranche2_days:
                 if sym in bars_latest.index:
-                    curr_p = float(bars_latest.loc[sym]["close"])
+                    b = bars_latest.loc[sym]
+                    # Upper circuit check
+                    if (float(b["high"]) == float(b["low"])) or (float(b["open"]) == float(b["high"]) and float(b["high"]) == float(b["low"])):
+                        continue
+                    curr_p = float(b["close"])
                     # ONLY if in profit!
                     if curr_p > float(pos["entry_price"]):
                         t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5)
@@ -381,10 +394,15 @@ class LivePortfolioManager:
                             t2_shares = (t2_alloc - t2_friction) / curr_p
                             self.state.cash -= t2_alloc
 
-                            pos["shares"] += t2_shares
-                            pos["invested_capital"] += t2_alloc
-                            pos["entry_price"] = pos["invested_capital"] / pos["shares"]
-                            pos["entry_price_with_friction"] = pos["invested_capital"] / pos["shares"]
+                            t1_shares = float(pos["shares"])
+                            t1_invested = float(pos["invested_capital"])
+                            t1_price = t1_invested / t1_shares if t1_shares > 0 else curr_p
+                            total_shares = t1_shares + t2_shares
+
+                            pos["shares"] = total_shares
+                            pos["invested_capital"] = t1_invested + t2_alloc
+                            pos["entry_price"] = (t1_price * (t1_shares / total_shares)) + (curr_p * (t2_shares / total_shares))
+                            pos["entry_price_with_friction"] = pos["entry_price"] * (1.0 + self.cost_per_side)
                             pos["tranche2_active"] = True
                             pos["tranche2_date"] = today_date
                             pos["tranche2_shares"] = t2_shares
@@ -412,6 +430,9 @@ class LivePortfolioManager:
                     continue
 
                 bar = bars_latest.loc[sym]
+                # Upper circuit check: true upper circuit when high == low or open == high == low
+                if (float(bar["high"]) == float(bar["low"])) or (float(bar["open"]) == float(bar["high"]) and float(bar["high"]) == float(bar["low"])):
+                    continue
                 fill_price = float(bar["close"])
 
                 t1_alloc = min(self.state.cash, slot_target_capital * 0.5)

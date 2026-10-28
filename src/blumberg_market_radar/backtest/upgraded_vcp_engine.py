@@ -12,6 +12,11 @@ Principal Quantitative Architecture incorporating:
    - use_vol_parity: Volatility-Parity sizing inverse to ATR% to balance risk across portfolio assets.
    - use_sector_leadership: Restricting and boosting candidates belonging to top relative strength sectors.
 6. Execution Microstructure Realism:
+   - Statutory + Slippage: 102.6 bps per side (205.2 bps round trip)
+     [Conservative estimate for Indian delivery segment:
+      50 bps slippage + 52.6 bps statutory (STT+GST+Stamp+Exchange)]
+   - Live deployment expected cost: ~55-70 bps per side
+   - Backtest uses higher figure for margin-of-safety buffer
    - T+1 morning cash & slot freeze (zero same-day exit capital recycling lookahead).
    - High-before-low lookahead elimination (stops evaluated against prior day's peak price).
    - Gap-down fill protection (fills at min(floor, open), never fake shielded max).
@@ -89,7 +94,7 @@ class UpgradedVCPBacktestEngine:
     def __init__(
         self,
         initial_capital: float = 1_000_000.0,
-        max_slots: int = 7,  # Champion 7 focused slots
+        max_slots: int = 8,  # Champion 8 focused slots (Sweet spot)
         risk_per_trade_pct: float = 0.02,  # 2% equity risk
         min_turnover_rs: float = 30_000_000.0,  # Rs 3 Crores (scaled dynamically)
         slippage_bps_per_side: float = 20.0,  # 20 bps realistic liquid execution
@@ -294,8 +299,8 @@ class UpgradedVCPBacktestEngine:
                         s_df = symbol_data[sym]
                         if cur_date in s_df.index:
                             bar = s_df.loc[cur_date]
-                            # Upper circuit check
-                            if not (bar["open"] == bar["high"] and bar["high"] == bar["low"]):
+                            # Upper circuit check: true upper circuit when high == low or open == high == low
+                            if not ((bar["high"] == bar["low"]) or (bar["open"] == bar["high"] and bar["high"] == bar["low"])):
                                 t2_alloc = min(available_cash_for_entry, tr.target_slot_capital * 0.5)
                                 if t2_alloc >= 2500.0:
                                     raw_t2 = bar["open"]
@@ -307,8 +312,15 @@ class UpgradedVCPBacktestEngine:
                                     available_cash_for_entry -= t2_alloc
 
                                     tr.shares += t2_shares
-                                    tr.invested_capital += t2_alloc
-                                    tr.entry_price = tr.invested_capital / tr.shares  # Blended entry
+                                    tr.invested_capital += t2_alloc  # Total cash deployed (both tranches)
+
+                                    # Correct blended entry: weighted average of both tranche fill prices
+                                    t1_price = tr.tranche1_invested / tr.tranche1_shares if tr.tranche1_shares > 0 else raw_t2
+                                    t2_price = raw_t2
+                                    t1_weight = tr.tranche1_shares / tr.shares
+                                    t2_weight = t2_shares / tr.shares
+
+                                    tr.entry_price = (t1_price * t1_weight) + (t2_price * t2_weight)
                                     tr.entry_price_with_friction = tr.entry_price * (1.0 + self.cost_per_side)
                                     tr.tranche2_active = True
                                     tr.tranche2_date = cur_date
@@ -399,8 +411,8 @@ class UpgradedVCPBacktestEngine:
                         continue
                     bar = s_df.loc[cur_date]
 
-                    # Upper Circuit Rejection: open == high == low
-                    if bar["open"] == bar["high"] and bar["high"] == bar["low"]:
+                    # Upper Circuit Rejection: true upper circuit when high == low or open == high == low
+                    if (bar["high"] == bar["low"]) or (bar["open"] == bar["high"] and bar["high"] == bar["low"]):
                         continue
 
                     # Sizing: Equal-Weight Slots (Zero Idle Cash) vs Risk Parity (Alpha Booster 1)
@@ -528,13 +540,14 @@ class UpgradedVCPBacktestEngine:
                         tr.tranche2_eligible = True
 
                 # -------------------------------------------------------------
-                # STAGE 5: PARABOLIC CLIMAX EXIT (Blow-off Top check)
+                # STAGE 5: PARABOLIC CLIMAX EXIT (Prior Peak Gain >= +100%)
                 # -------------------------------------------------------------
-                if tr.is_climax_reached and gain_from_entry >= 50.0:
-                    if bar["close"] < bar["ema20"] or dip_from_peak <= -15.0:
+                # Only activates after a genuine doubling, uses -25% trailing from peak
+                if tr.is_climax_reached and gain_from_entry >= 100.0:
+                    if dip_from_peak <= -25.0:
                         exit_triggered = True
-                        exit_price = min(bar["open"], bar["close"]) if bar["open"] < bar["close"] else bar["close"]
-                        exit_reason = "Parabolic Climax Exit (Blow-off Top Protection)"
+                        exit_price = min(prior_peak * 0.75, bar["open"])  # gap-down protected
+                        exit_reason = "Parabolic Climax Exit (-25% Trail from Peak)"
                         stage_name = "Stage 5: Climax Exit"
 
                 # -------------------------------------------------------------
@@ -611,33 +624,45 @@ class UpgradedVCPBacktestEngine:
 
                 # Execute Exit if Triggered
                 if exit_triggered:
-                    sell_friction = exit_price * tr.shares * self.cost_per_side
-                    net_proceeds = (exit_price * tr.shares) - sell_friction
-                    total_friction_paid += sell_friction
-                    cash += net_proceeds  # Becomes available starting next day
+                    # Lower circuit check: if stock is locked limit-down, cannot sell today
+                    is_lower_circuit = (bar["high"] == bar["low"]) or ((bar["open"] == bar["low"]) and (bar["close"] <= bar["open"]))
+                    if is_lower_circuit and exit_reason != "Dead Money Time-Stop Exit (30d Stagnation)":
+                        # Cannot exit today — defer exit to next session
+                        tr.exit_reason = f"PENDING: {exit_reason} (Lower Circuit - Deferred)"
+                        exit_triggered = False  # Defer exit to next session
+                    else:
+                        sell_friction = exit_price * tr.shares * self.cost_per_side
+                        net_proceeds = (exit_price * tr.shares) - sell_friction
+                        total_friction_paid += sell_friction
+                        cash += net_proceeds  # Becomes available starting next day
 
-                    tr.exit_date = cur_date
-                    tr.exit_price = exit_price
-                    tr.exit_price_net = exit_price * (1.0 - self.cost_per_side)
-                    tr.exit_reason = exit_reason
-                    tr.stage_at_exit = stage_name
-                    tr.peak_gain_pct = (tr.peak_price / tr.entry_price - 1.0) * 100.0
-                    tr.gross_return_pct = (exit_price / tr.entry_price - 1.0) * 100.0
-                    tr.net_return_pct = (tr.exit_price_net / tr.entry_price_with_friction - 1.0) * 100.0
-                    tr.pnl_amount = net_proceeds - tr.invested_capital
-                    tr.calendar_days = (cur_date - tr.entry_date).days
-                    tr.bars_held += 1
-                    tr.status = "Closed"
+                        tr.exit_date = cur_date
+                        tr.exit_price = exit_price
+                        tr.exit_price_net = exit_price * (1.0 - self.cost_per_side)
+                        tr.exit_reason = exit_reason
+                        tr.stage_at_exit = stage_name
+                        tr.peak_gain_pct = (tr.peak_price / tr.entry_price - 1.0) * 100.0
+                        tr.gross_return_pct = (exit_price / tr.entry_price - 1.0) * 100.0
+                        tr.net_return_pct = (tr.exit_price_net / tr.entry_price_with_friction - 1.0) * 100.0
+                        tr.pnl_amount = net_proceeds - tr.invested_capital
+                        tr.calendar_days = (cur_date - tr.entry_date).days
+                        tr.bars_held += 1
+                        tr.status = "Closed"
 
-                    closed_trades.append(tr)
-                    symbols_to_close.append(sym)
-                else:
+                        closed_trades.append(tr)
+                        symbols_to_close.append(sym)
+
+                if not exit_triggered:
                     # Trade survived today's session: update peak price & climax flag safely
                     if bar["high"] > tr.peak_price:
                         tr.peak_price = bar["high"]
-                    is_climax = (bar["close"] / bar["ema100"] - 1.0) > 0.60
-                    if is_climax:
+                    # Climax flag: set when 60% above 100 EMA, reset if stock normalizes below 35%
+                    is_climax_now = (bar["close"] / bar["ema100"] - 1.0) > 0.60
+                    if is_climax_now:
                         tr.is_climax_reached = True
+                    elif tr.is_climax_reached and (bar["close"] / bar["ema100"] - 1.0) < 0.35:
+                        # Stock has cooled down from parabolic zone — reset flag
+                        tr.is_climax_reached = False
                     tr.bars_held += 1
 
             for sym in symbols_to_close:
