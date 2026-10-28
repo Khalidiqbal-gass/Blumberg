@@ -334,9 +334,9 @@ class LivePortfolioManager:
 
             if exit_triggered:
                 # Lower circuit check: if stock is locked limit-down, cannot sell today
-                is_lower_circuit = (low_p == high_p) or ((open_p == low_p) and (close_p <= open_p))
+                is_lower_circuit = (open_p == low_p and high_p == low_p)  # truly locked: zero range
                 if is_lower_circuit and "Dead Money" not in exit_reason:
-                    pos["current_stage"] = f"PENDING: {exit_reason} (Lower Circuit - Deferred)"
+                    pos["current_stage"] = f"CIRCUIT_DEFER: {exit_reason}"
                     actions_taken.append(f"⚠️ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
                     if high_p > prior_peak:
                         pos["peak_price"] = high_p
