@@ -88,5 +88,5 @@ def test_lower_circuit_exit_deferral(temp_portfolio):
 
     # Position must NOT be closed because it was locked limit-down (exit deferred!)
     assert summary2["active_positions_count"] == 1
-    assert "PENDING" in temp_portfolio.state.active_positions["DIXON"]["current_stage"]
+    assert "CIRCUIT_DEFER" in temp_portfolio.state.active_positions["DIXON"]["current_stage"]
 
