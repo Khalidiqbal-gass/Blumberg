@@ -55,6 +55,7 @@ class LiveTradePosition:
     stop_loss_price: float = 0.0
     profit_floor_price: float = 0.0
     bars_held: int = 1
+    is_climax_reached: bool = False
     sector: str = "Diversified"
     selection_reason: str = "VCP Volatility Contraction Breakout"
 
@@ -396,7 +397,7 @@ class LivePortfolioManager:
 
                             t1_shares = float(pos["shares"])
                             t1_invested = float(pos["invested_capital"])
-                            t1_price = t1_invested / t1_shares if t1_shares > 0 else curr_p
+                            t1_price = float(pos.get("tranche1_price", pos["entry_price"]))
                             total_shares = t1_shares + t2_shares
 
                             pos["shares"] = total_shares

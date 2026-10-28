@@ -119,7 +119,8 @@ class UpgradedVCPBacktestEngine:
         self.use_equal_weight_slots = use_equal_weight_slots
         self.cash_yield_pct_p_a = cash_yield_pct_p_a
 
-        # Total cost per side = 50 + 52.6 = 102.6 bps = 0.01026
+        # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
+        # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
         self.cost_per_side = (slippage_bps_per_side + statutory_bps_per_side) / 10_000.0
 
     @staticmethod
@@ -314,9 +315,9 @@ class UpgradedVCPBacktestEngine:
                                     tr.shares += t2_shares
                                     tr.invested_capital += t2_alloc  # Total cash deployed (both tranches)
 
-                                    # Correct blended entry: weighted average of both tranche fill prices
-                                    t1_price = tr.tranche1_invested / tr.tranche1_shares if tr.tranche1_shares > 0 else raw_t2
-                                    t2_price = raw_t2
+                                    # Correct blended entry: weighted average of pure fill prices
+                                    t1_price = tr.entry_price  # Pure fill price of tranche 1
+                                    t2_price = raw_t2          # Pure fill price of tranche 2
                                     t1_weight = tr.tranche1_shares / tr.shares
                                     t2_weight = t2_shares / tr.shares
 
@@ -339,7 +340,8 @@ class UpgradedVCPBacktestEngine:
                         s_df = symbol_data[sym]
                         if cur_date in s_df.index:
                             bar = s_df.loc[cur_date]
-                            if not (bar["open"] == bar["high"] and bar["high"] == bar["low"]):
+                            # Upper circuit check: true upper circuit when high == low or open == high == low
+                            if not ((bar["high"] == bar["low"]) or (bar["open"] == bar["high"] and bar["high"] == bar["low"])):
                                 alloc_capital = min(w["target_capital"], max_slot_capital, available_cash_for_entry)
                                 if alloc_capital >= 5000.0:
                                     raw_entry = bar["open"]
@@ -543,17 +545,18 @@ class UpgradedVCPBacktestEngine:
                 # STAGE 5: PARABOLIC CLIMAX EXIT (Prior Peak Gain >= +100%)
                 # -------------------------------------------------------------
                 # Only activates after a genuine doubling, uses -25% trailing from peak
-                if tr.is_climax_reached and gain_from_entry >= 100.0:
-                    if dip_from_peak <= -25.0:
+                if gain_from_entry >= 100.0:
+                    floor_5 = prior_peak * 0.75
+                    if bar["low"] <= floor_5 or dip_from_peak <= -25.0:
                         exit_triggered = True
-                        exit_price = min(prior_peak * 0.75, bar["open"])  # gap-down protected
+                        exit_price = min(floor_5, bar["open"])  # gap-down protected
                         exit_reason = "Parabolic Climax Exit (-25% Trail from Peak)"
                         stage_name = "Stage 5: Climax Exit"
 
                 # -------------------------------------------------------------
-                # STAGE 4: SECULAR COMPOUNDING (Prior Peak Gain >= 50%)
+                # STAGE 4: SECULAR COMPOUNDING (+50% <= Prior Peak Gain < +100%)
                 # -------------------------------------------------------------
-                elif gain_from_entry >= 50.0 and not exit_triggered:
+                elif 50.0 <= gain_from_entry < 100.0 and not exit_triggered:
                     floor_4 = tr.entry_price * 1.25
                     # Hard floor locked at +25% (Gap-Down Protected: min, never max)
                     if bar["low"] <= floor_4:
