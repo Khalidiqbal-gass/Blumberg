@@ -53,14 +53,14 @@ def main():
     bench_df = pd.read_parquet(BENCH_PARQUET)
     print(f"Loaded {len(bars_df):,} bars across {bars_df['symbol'].nunique()} equities up to {bars_df['date'].max()}.\n")
 
-    # Initialize 8-Slot Engine
+    # Initialize 8-Slot Engine (Conservative 102.6 bps transaction drag per Claude patch)
     engine_8 = UpgradedVCPBacktestEngine(
         initial_capital=1_000_000.0,
         max_slots=8,
         mode="HYBRID_50_50",
         min_turnover_rs=30_000_000.0,
-        slippage_bps_per_side=20.0,
-        statutory_bps_per_side=35.0,
+        slippage_bps_per_side=50.0,
+        statutory_bps_per_side=52.6,
         use_equal_weight_slots=True,
         cash_yield_pct_p_a=6.5,
         use_sector_leadership=True,
