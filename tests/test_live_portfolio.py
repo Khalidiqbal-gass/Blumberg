@@ -8,7 +8,7 @@ from blumberg_market_radar.pipeline.live_portfolio import LivePortfolioManager, 
 @pytest.fixture
 def temp_portfolio(tmp_path):
     state_file = tmp_path / "test_portfolio.json"
-    mgr = LivePortfolioManager(state_path=state_file, initial_capital=1_000_000.0, max_slots=7)
+    mgr = LivePortfolioManager(state_path=state_file, initial_capital=1_000_000.0, max_slots=8)
     return mgr
 
 def test_initial_state(temp_portfolio):
@@ -16,7 +16,7 @@ def test_initial_state(temp_portfolio):
     assert summary["initial_capital"] == 1_000_000.0
     assert summary["cash"] == 1_000_000.0
     assert summary["active_positions_count"] == 0
-    assert summary["available_slots"] == 7
+    assert summary["available_slots"] == 8
     assert summary["total_equity"] == 1_000_000.0
 
 def test_execution_tranche1_and_exit(temp_portfolio):
