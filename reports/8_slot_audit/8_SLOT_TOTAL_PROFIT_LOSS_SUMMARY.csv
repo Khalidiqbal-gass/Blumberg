@@ -1,2 +1,2 @@
 Metric,Starting_Capital_Rs,Final_Capital_Rs,Multiple,CAGR_Pct,Max_Drawdown_Pct,Total_Trades,Winning_Trades,Losing_Trades,Win_Rate_Pct,Gross_Profit_Rs,Gross_Loss_Rs,Net_Realized_PnL_Rs,Total_Friction_Paid_Rs,Total_SL_Hits,Hard_Stop_Hits,Closing_Stop_Hits,Dead_Money_Hits,Trailing_Floor_Exits
-8-Slot Master Backtest (2000-2026),1000000.0,604340247.58,604.34,26.99,-37.8,660,264,396,40.0,981261319.12,-372433873.77,608827445.35,98594310.79,235,118,0,117,234
+8-Slot Master Backtest (2000-2026),1000000.0,736177434.45,736.18,27.93,-42.66,605,250,355,41.32,1121441136.02,-377685335.91,743755800.11,107931400.17,218,114,0,104,227
