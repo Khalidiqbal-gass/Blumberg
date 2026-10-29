@@ -207,3 +207,12 @@ def test_engine_cleans_single_bar_glitches_by_default():
     eng_off = UpgradedVCPBacktestEngine(clean_glitches=False)
     eng_off.run_backtest(df, bench)
     assert eng_off.glitch_bars_repaired == 0
+
+
+def test_liquidity_cap_limits_fill_size():
+    from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
+    eng = UpgradedVCPBacktestEngine(max_pct_of_adv=10.0)
+    bar = pd.Series({"adv_20": 20_000_000.0})
+    assert eng._liquidity_cap(bar) == 2_000_000.0
+    assert UpgradedVCPBacktestEngine(max_pct_of_adv=None)._liquidity_cap(bar) == float("inf")
+    assert eng._liquidity_cap(pd.Series({"adv_20": float("nan")})) == float("inf")

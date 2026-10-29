@@ -98,3 +98,19 @@ def test_unresolved_corporate_action_drop_is_force_exited_after_three_sessions(t
         temp_portfolio.execute_daily_rebalance(_bar(d, 600.0, 640.0, 590.0, 610.0), BENCH, pd.DataFrame(), current_date_str=d)
     assert temp_portfolio.get_summary()["active_positions_count"] == 0
     assert "forced exit" in temp_portfolio.state.closed_trades[-1]["exit_reason"]
+
+
+def test_live_fill_is_capped_by_adv(temp_portfolio):
+    # ~20 prior sessions of thin volume: turnover ~ Rs 1 Cr/day -> 10% cap = ~Rs 10 L per fill (vs Rs 5 L target? raise target via capital)
+    mgr = LivePortfolioManager(state_path=temp_portfolio.state_path.with_name("big.json"), initial_capital=100_000_000.0, max_slots=8)
+    dates = pd.bdate_range("2026-09-01", periods=25)
+    rows = [{"date": d.strftime("%Y-%m-%d"), "symbol": "DIXON", "open": 1000.0, "high": 1010.0, "low": 990.0,
+             "close": 1000.0, "volume": 10_000} for d in dates]          # turnover = Rs 1 Cr/day
+    bars = pd.DataFrame(rows)
+    last = dates[-1].strftime("%Y-%m-%d")
+    mgr.execute_daily_rebalance(bars, BENCH, CAND, current_date_str=last)
+    nxt = (dates[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    bars2 = pd.concat([bars, pd.DataFrame([{"date": nxt, "symbol": "DIXON", "open": 1000.0, "high": 1010.0, "low": 990.0, "close": 1005.0, "volume": 10_000}])])
+    mgr.execute_daily_rebalance(bars2, BENCH, pd.DataFrame(), current_date_str=nxt)
+    pos = mgr.state.active_positions["DIXON"]
+    assert pos["invested_capital"] <= 1_000_000.0 + 1.0   # 10% of Rs 1 Cr ADV, not Rs 6.25 Cr (half of a 12.5 Cr slot)

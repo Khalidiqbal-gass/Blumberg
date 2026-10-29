@@ -116,6 +116,7 @@ class UpgradedVCPBacktestEngine:
         gap_loss_cap_pct: float | None = 20.0,  # Hard-stop gap fill floor (-20%). None = fill at the real open (stress mode)
         stage5_fill_mode: str = "FLOOR",        # "FLOOR" = fill at -25% trail (optimistic); "CLOSE" = fill at the close that triggered it (realistic)
         stale_exit_sessions: int | None = 20,
+        max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg daily turnover (None = unlimited, legacy optimism)
         clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does   # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
     ) -> None:
         self.initial_capital = initial_capital
@@ -134,6 +135,7 @@ class UpgradedVCPBacktestEngine:
         self.stage5_fill_mode = stage5_fill_mode.upper()
         self.stale_exit_sessions = stale_exit_sessions
         self.clean_glitches = clean_glitches
+        self.max_pct_of_adv = max_pct_of_adv
 
         # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
         # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
@@ -171,6 +173,7 @@ class UpgradedVCPBacktestEngine:
         vol_mean_20d = df["volume"].shift(1).rolling(20, min_periods=10).mean()
         df["rvol"] = df["volume"] / vol_mean_20d.where(vol_mean_20d > 0, 1.0)
         df["turnover"] = df["close"] * df["volume"]
+        df["adv_20"] = df["turnover"].shift(1).rolling(20, min_periods=10).mean()  # known before the open
 
         # 5. Relative Strength vs Benchmark (63 Days / 3 Months)
         stock_ret_63d = df["close"].pct_change(63)
@@ -199,6 +202,15 @@ class UpgradedVCPBacktestEngine:
             liquidity_ok
         )
         return df
+
+    def _liquidity_cap(self, bar: Any) -> float:
+        """Max rupee size of one fill = max_pct_of_adv % of 20d average daily turnover (inf if disabled / unknown)."""
+        if self.max_pct_of_adv is None:
+            return float("inf")
+        adv = bar["adv_20"] if "adv_20" in bar.index else float("nan")
+        if pd.isnull(adv) or adv <= 0:
+            return float("inf")
+        return float(adv) * self.max_pct_of_adv / 100.0
 
     def run_backtest(
         self,
@@ -325,7 +337,7 @@ class UpgradedVCPBacktestEngine:
                             bar = s_df.loc[cur_date]
                             # FIX #6a: Complete upper circuit check (high == low = zero range)
                             if not (bar["high"] == bar["low"]):
-                                t2_alloc = min(available_cash_for_entry, tr.target_slot_capital * 0.5)
+                                t2_alloc = min(available_cash_for_entry, tr.target_slot_capital * 0.5, self._liquidity_cap(bar))
                                 if t2_alloc >= 2500.0:
                                     raw_t2 = bar["open"]
                                     t2_friction = t2_alloc * self.cost_per_side
@@ -468,7 +480,7 @@ class UpgradedVCPBacktestEngine:
                     if exec_mode == "LAYER_1_FULL":
                         if available_slots <= 0 or available_cash_for_entry < 5000.0:
                             break
-                        alloc_capital = min(target_capital, available_cash_for_entry)
+                        alloc_capital = min(target_capital, available_cash_for_entry, self._liquidity_cap(bar))
                         if alloc_capital < 5000.0:
                             continue
                         raw_entry = bar["open"]
@@ -500,7 +512,7 @@ class UpgradedVCPBacktestEngine:
                     elif exec_mode == "HYBRID_50_50":
                         if available_slots <= 0 or available_cash_for_entry < 2500.0:
                             break
-                        alloc_capital = min(target_capital * 0.5, available_cash_for_entry)
+                        alloc_capital = min(target_capital * 0.5, available_cash_for_entry, self._liquidity_cap(bar))
                         if alloc_capital < 2500.0:
                             continue
                         raw_entry = bar["open"]

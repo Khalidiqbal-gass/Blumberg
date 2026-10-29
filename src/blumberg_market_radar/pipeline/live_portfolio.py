@@ -101,6 +101,7 @@ class LivePortfolioManager:
         slippage_bps: float = 50.0,
         statutory_bps: float = 52.6,
         cash_yield_pct_p_a: float = 6.5,
+        max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg turnover (same as backtest)
     ):
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +109,7 @@ class LivePortfolioManager:
         self.max_slots = max_slots
         self.tranche2_days = tranche2_days
         self.cost_per_side = (slippage_bps + statutory_bps) / 10_000.0
+        self.max_pct_of_adv = max_pct_of_adv
         self.cash_yield_daily = (cash_yield_pct_p_a / 100.0) / 252.0
         self.state = self.load_state()
 
@@ -246,6 +248,17 @@ class LivePortfolioManager:
                 lambda s: s.rolling(14, min_periods=14).mean()
             )
 
+        if "adv_20" not in bars_proc.columns and "volume" in bars_proc.columns:
+            _turn = bars_proc["close"] * bars_proc["volume"]
+            bars_proc["adv_20"] = _turn.groupby(bars_proc["symbol"]).transform(
+                lambda x: x.shift(1).rolling(20, min_periods=10).mean()
+            )
+
+        def _liq_cap(b_) -> float:
+            if self.max_pct_of_adv is None or "adv_20" not in b_.index or pd.isna(b_["adv_20"]) or float(b_["adv_20"]) <= 0:
+                return float("inf")
+            return float(b_["adv_20"]) * self.max_pct_of_adv / 100.0
+
         if "prev_close" not in bars_proc.columns:
             bars_proc["prev_close"] = bars_proc.groupby("symbol")["close"].shift(1)
         for _span in (20, 50, 100):
@@ -279,7 +292,7 @@ class LivePortfolioManager:
                     if b is None or float(b["high"]) == float(b["low"]):  # no bar / upper-circuit lock
                         continue
                     raw_t2 = float(b["open"])
-                    t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5)
+                    t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5, _liq_cap(b))
                     if t2_alloc < 2500.0:
                         continue
                     t2_shares = (t2_alloc * (1.0 - self.cost_per_side)) / raw_t2
@@ -324,7 +337,7 @@ class LivePortfolioManager:
                         actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at circuit, no entry")
                         continue
                     raw_entry = float(b["open"])
-                    t1_alloc = min(self.state.cash, slot_cap * 0.5)
+                    t1_alloc = min(self.state.cash, slot_cap * 0.5, _liq_cap(b))
                     if t1_alloc < 2500.0:
                         continue
                     t1_shares = (t1_alloc * (1.0 - self.cost_per_side)) / raw_entry
