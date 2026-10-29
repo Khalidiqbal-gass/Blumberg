@@ -652,7 +652,7 @@ def fetch_angel_one_ohlcv(
         conn = get_angel_connector()
         df = conn.fetch_bars_for_symbols(symbols, days=days, use_cache=use_cache)
         if not df.empty:
-            return validate_ohlcv(df)
+            return validate_ohlcv(df, clean_glitches=True)
     except Exception as exc:
         logger.warning(f"Angel One fetch exception: {exc}")
     return pd.DataFrame()
@@ -688,7 +688,7 @@ def fetch_historical_ohlcv(
         try:
             cached_df = pd.read_parquet(target_cache)
             logger.info(f"Loaded {len(cached_df)} bars from cache {target_cache}")
-            return validate_ohlcv(cached_df)
+            return validate_ohlcv(cached_df, clean_glitches=True)
         except Exception as exc:
             logger.warning(f"Failed to read cache {target_cache}: {exc}. Re-fetching.")
 
@@ -748,7 +748,7 @@ def fetch_historical_ohlcv(
         return synthetic_df
 
     combined = pd.concat(frames, ignore_index=True)
-    validated = validate_ohlcv(combined)
+    validated = validate_ohlcv(combined, clean_glitches=True)
 
     if use_cache:
         try:
@@ -769,7 +769,7 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             days = 300 if "1y" in period or "2y" in period else 120
             bench = conn.fetch_nifty_benchmark(days=days)
             if not bench.empty:
-                return validate_ohlcv(bench)
+                return validate_ohlcv(bench, clean_glitches=True)
         except Exception as e:
             logger.warning(f"Angel One benchmark fetch failed: {e}. Falling back to default.")
 
@@ -793,7 +793,7 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             "close": pd.to_numeric(raw["close"], errors="coerce"),
             "volume": pd.to_numeric(raw["volume"], errors="coerce"),
         }).dropna()
-        return validate_ohlcv(bench)
+        return validate_ohlcv(bench, clean_glitches=True)
     except Exception:
         # Fallback synthetic benchmark
         dates = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=300, freq="B")
@@ -911,4 +911,4 @@ def generate_synthetic_universe(
         all_bars.append(df)
 
     combined = pd.concat(all_bars, ignore_index=True)
-    return validate_ohlcv(combined)
+    return validate_ohlcv(combined, clean_glitches=True)

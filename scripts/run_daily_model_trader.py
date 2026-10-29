@@ -71,9 +71,9 @@ def run_daily_autonomous_trader(
 
     # Use recent bars for feature scanning
     max_dt = bars_df["date"].max()
-    recent_bars = bars_df[bars_df["date"] >= (max_dt - pd.Timedelta(days=365))].copy()
+    recent_bars = bars_df[bars_df["date"] >= (max_dt - pd.Timedelta(days=730))].copy()
     recent_bars = validate_ohlcv(recent_bars, clean_glitches=True)
-    recent_bench = bench_df[bench_df["date"] >= (max_dt - pd.Timedelta(days=365))].copy()
+    recent_bench = bench_df[bench_df["date"] >= (max_dt - pd.Timedelta(days=730))].copy()
 
     print(f"Loaded {len(recent_bars):,} bars across {recent_bars['symbol'].nunique()} equities up to {max_dt.strftime('%Y-%m-%d')}.")
 
@@ -91,8 +91,8 @@ def run_daily_autonomous_trader(
         initial_capital=initial_capital,
         max_slots=8,
         tranche2_days=7,
-        slippage_bps=20.0,
-        statutory_bps=35.0,
+        slippage_bps=50.0,
+        statutory_bps=52.6,
     )
 
     # 4. Apply Sector Concentration Guardrail (Max 2 stocks per sector in 8-slot model = 25% sector cap)

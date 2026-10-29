@@ -30,7 +30,7 @@ def simulate_next_close_entries(
     # Strict structural validation
     has_full_ohlcv = {"open", "high", "low", "volume"}.issubset(bars_with_signal.columns)
     if has_full_ohlcv:
-        clean = validate_ohlcv(bars_with_signal)
+        clean = validate_ohlcv(bars_with_signal, clean_glitches=True)
         clean[signal_column] = bars_with_signal.loc[clean.index, signal_column].fillna(False).astype(bool)
     else:
         # Close-only validation: reject duplicates and non-positive prices
@@ -99,7 +99,7 @@ def simulate_multiday_trend_trades(
     if signal_column not in bars_with_signal.columns:
         raise ValueError(f"Missing required signal column: '{signal_column}'")
 
-    clean = validate_ohlcv(bars_with_signal)
+    clean = validate_ohlcv(bars_with_signal, clean_glitches=True)
     clean[signal_column] = bars_with_signal.loc[clean.index, signal_column].fillna(False).astype(bool)
 
     one_side = cost_bps_per_side / 10_000.0

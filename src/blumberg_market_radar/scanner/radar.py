@@ -25,7 +25,7 @@ def compute_pre_rally_features(
     - Prices are normalized so a ₹10 stock and a ₹2,000 stock are evaluated fairly.
     - Populates sector metadata and computes sector peer relative strength.
     """
-    clean = validate_ohlcv(bars)
+    clean = validate_ohlcv(bars, clean_glitches=True)
     if clean.empty:
         return clean
 
@@ -35,7 +35,7 @@ def compute_pre_rally_features(
     bench_ret_20d: dict[pd.Timestamp, float] = {}
     bench_ret_60d: dict[pd.Timestamp, float] = {}
     if benchmark_bars is not None and not benchmark_bars.empty:
-        b_clean = validate_ohlcv(benchmark_bars).sort_values("date")
+        b_clean = validate_ohlcv(benchmark_bars, clean_glitches=True).sort_values("date")
         b_clean["b_ret_20d"] = b_clean["close"].pct_change(20, fill_method=None)
         b_clean["b_ret_60d"] = b_clean["close"].pct_change(60, fill_method=None)
         b_norm = b_clean["date"].dt.normalize()
