@@ -726,7 +726,7 @@ def generate_model_card(
         "feature_importances": (
             feature_importances.to_dict() if feature_importances is not None else {}
         ),
-        "governance_status": "APPROVED_FOR_PAPER_TRACKING",
+        "governance_status": "EXPERIMENTAL_RESEARCH_SANDBOX_ONLY",
     }
 
     # Format Markdown document
@@ -770,7 +770,7 @@ def generate_model_card(
 **Version:** `{card_dict['model_version']}`  
 **Model Family:** Pairwise Learning-to-Rank (LambdaRank via LightGBM)  
 **Evaluated On:** Out-of-Sample Walk-Forward Test Set with 20-Day Embargo Buffer  
-**Status:** `GATE_PASSED — CANDIDATE READY FOR PAPER TRACKING`  
+**Status:** `EXPERIMENTAL — NOT APPROVED FOR PRODUCTION (RESEARCH SANDBOX ONLY)`  
 
 ---
 
@@ -879,9 +879,9 @@ Ranked contribution of multi-factor signals to the LambdaRank model:
 
 | Stakeholder Role | Verification Method | Status | Date |
 | :--- | :--- | :---: | :---: |
-| **Lead ML Ranking Engineer** | Out-of-sample walk-forward validation & NDCG verification | `APPROVED` | {card_dict['created_date']} |
-| **Quantitative Risk Officer** | Embargo buffer verification & circuit failure mode review | `APPROVED` | {card_dict['created_date']} |
-| **Product Governance Lead** | Phase 6 acceptance criteria compliance check | `APPROVED` | {card_dict['created_date']} |
+| **ML Research Module** | Out-of-sample walk-forward validation & NDCG verification | `EXPERIMENTAL - PROTOTYPE` | {card_dict['created_date']} |
+| **Quantitative Engine** | Active execution engine link status | `DISCONNECTED - ENGINE USES RS_SCORE` | {card_dict['created_date']} |
+| **Production Status** | Live trading & Backtest gate check | `RESEARCH SANDBOX ONLY` | {card_dict['created_date']} |
 """
 
     out_file = Path(output_path)

@@ -494,7 +494,7 @@ with tab_portfolio:
     st.markdown("---")
 
     # Active Holdings Section
-    st.markdown("##### 📈 Active Portfolio Holdings (10 Max Slots — 10.0% Allocation Each)")
+    st.markdown("##### 📈 Active Portfolio Holdings (8 Max Slots — 12.5% Allocation Each)")
     active_pos = list(portfolio_mgr.state.active_positions.values())
     if not active_pos:
         st.info("No active holdings currently in portfolio. Click '**⚡ Execute Today's Rebalance**' above to deploy capital into today's top VCP candidates!")
