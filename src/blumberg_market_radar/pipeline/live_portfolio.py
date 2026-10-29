@@ -261,7 +261,8 @@ class LivePortfolioManager:
             low_p = float(bar["low"])
             high_p = float(bar["high"])
 
-            entry_p = float(pos["entry_price"])
+            # Anchor entry price to Tranche 1 breakout price so adding Tranche 2 does not distort ratchet milestones
+            entry_p = float(pos.get("tranche1_price", pos["entry_price"]))
             prior_peak = float(pos.get("peak_price", entry_p))
             gain_from_entry = (prior_peak / entry_p - 1.0) * 100.0
 

@@ -41,6 +41,7 @@ class UpgradedTrade:
     invested_capital: float
     dollar_risk: float
     target_slot_capital: float = 0.0
+    initial_entry_price: float = 0.0
     tranche1_invested: float = 0.0
     tranche1_shares: float = 0.0
     tranche2_active: bool = False
@@ -460,6 +461,7 @@ class UpgradedVCPBacktestEngine:
                             symbol=sym,
                             entry_date=cur_date,
                             entry_price=raw_entry,
+                            initial_entry_price=raw_entry,
                             entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
                             shares=shares,
                             invested_capital=alloc_capital,
@@ -491,6 +493,7 @@ class UpgradedVCPBacktestEngine:
                             symbol=sym,
                             entry_date=cur_date,
                             entry_price=raw_entry,
+                            initial_entry_price=raw_entry,
                             entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
                             shares=shares,
                             invested_capital=alloc_capital,
@@ -535,7 +538,8 @@ class UpgradedVCPBacktestEngine:
 
                 # Peak price established prior to today
                 prior_peak = tr.peak_price
-                gain_from_entry = (prior_peak / tr.entry_price - 1.0) * 100.0
+                ref_entry = tr.initial_entry_price if tr.initial_entry_price > 0 else tr.entry_price
+                gain_from_entry = (prior_peak / ref_entry - 1.0) * 100.0
                 dip_from_peak = (bar["close"] / prior_peak - 1.0) * 100.0
 
                 exit_triggered = False

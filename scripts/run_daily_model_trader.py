@@ -30,6 +30,7 @@ from blumberg_market_radar.scanner.radar import (
     apply_sector_cluster_guardrail,
 )
 from blumberg_market_radar.pipeline.live_portfolio import LivePortfolioManager
+from blumberg_market_radar.data.validation import validate_ohlcv
 
 DATA_DIR = PROJECT_ROOT / "data"
 STATE_FILE = DATA_DIR / "live_portfolio_state.json"
@@ -71,6 +72,7 @@ def run_daily_autonomous_trader(
     # Use recent bars for feature scanning
     max_dt = bars_df["date"].max()
     recent_bars = bars_df[bars_df["date"] >= (max_dt - pd.Timedelta(days=365))].copy()
+    recent_bars = validate_ohlcv(recent_bars, clean_glitches=True)
     recent_bench = bench_df[bench_df["date"] >= (max_dt - pd.Timedelta(days=365))].copy()
 
     print(f"Loaded {len(recent_bars):,} bars across {recent_bars['symbol'].nunique()} equities up to {max_dt.strftime('%Y-%m-%d')}.")
