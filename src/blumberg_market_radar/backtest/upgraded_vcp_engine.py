@@ -111,6 +111,8 @@ class UpgradedVCPBacktestEngine:
         incubation_days: int | None = None,
         use_equal_weight_slots: bool = True,  # True = 100% active slot allocation (no idle cash drag)
         cash_yield_pct_p_a: float = 6.5,  # Annualized 6.5% liquid fund/T-Bill yield on uninvested cash
+        entry_anchor_mode: str = "BLENDED_RAW",  # "BLENDED_RAW" (current standard) or "T1_INITIAL" (legacy ablation)
+        t1_blend_mode: str = "RAW_FILL",        # "RAW_FILL" (current standard) or "INVESTED_OVER_SHARES" (legacy ablation)
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -122,6 +124,8 @@ class UpgradedVCPBacktestEngine:
         self.tranche2_days = incubation_days if incubation_days is not None else tranche2_days
         self.use_equal_weight_slots = use_equal_weight_slots
         self.cash_yield_pct_p_a = cash_yield_pct_p_a
+        self.entry_anchor_mode = entry_anchor_mode
+        self.t1_blend_mode = t1_blend_mode
 
         # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
         # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
@@ -323,7 +327,10 @@ class UpgradedVCPBacktestEngine:
                                     # of actual T1 and T2 fill prices, not total_capital / total_shares.
                                     # total_capital/shares was wrong because invested_capital includes
                                     # friction deducted from shares (shares = (alloc - friction) / price).
-                                    t1_fill = tr.initial_entry_price if tr.initial_entry_price > 0 else raw_t2  # raw T1 fill, friction-free
+                                    if self.t1_blend_mode == "INVESTED_OVER_SHARES":
+                                        t1_fill = tr.tranche1_invested / tr.tranche1_shares if tr.tranche1_shares > 0 else raw_t2
+                                    else:
+                                        t1_fill = tr.initial_entry_price if tr.initial_entry_price > 0 else raw_t2  # raw T1 fill, friction-free
                                     t2_fill = raw_t2
                                     t1_w = tr.tranche1_shares / tr.shares  # weight of T1 shares
                                     t2_w = t2_shares / tr.shares            # weight of T2 shares
@@ -540,7 +547,11 @@ class UpgradedVCPBacktestEngine:
                 # Peak price established prior to today
                 prior_peak = tr.peak_price
                 # Single anchor (blended raw entry) for milestones, stops and floors, identical to live
-                gain_from_entry = (prior_peak / tr.entry_price - 1.0) * 100.0
+                if self.entry_anchor_mode == "T1_INITIAL":
+                    ref_entry = tr.initial_entry_price if tr.initial_entry_price > 0 else tr.entry_price
+                    gain_from_entry = (prior_peak / ref_entry - 1.0) * 100.0
+                else:
+                    gain_from_entry = (prior_peak / tr.entry_price - 1.0) * 100.0
                 dip_from_peak = (bar["close"] / prior_peak - 1.0) * 100.0
 
                 exit_triggered = False

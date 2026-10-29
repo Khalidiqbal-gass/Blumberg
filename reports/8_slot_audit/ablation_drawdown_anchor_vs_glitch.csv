@@ -1,0 +1,7 @@
+Config,Final_Cap_Cr,CAGR_Pct,Max_DD_Pct,DD_Peak_Date,DD_Trough_Date,DD_Peak_Cr,DD_Trough_Cr,Trades,Wins,WinRate_Pct,Profit_Factor
+1. Raw Data + Legacy Anchor (Pre-Patch Baseline),11.7,19.44,-59.53,2005-11-07,2005-11-21,0.66,0.27,756,161,21.3,2.22
+2. Raw Data + Legacy Anchor + Fixed T1 Fill,16.32,20.94,-58.55,2005-11-07,2005-11-21,0.67,0.28,717,165,23.0,2.29
+3. Raw Data + New Blended Anchor + Legacy T1 Fill,29.16,23.58,-36.25,2006-06-01,2007-04-02,1.47,0.94,672,162,24.1,2.22
+4. Raw Data + New Blended Anchor + Fixed T1 Fill (Current Committed),32.64,24.1,-41.27,2006-06-01,2007-04-02,1.55,0.91,648,166,25.6,2.3
+5. Clean Data + Legacy Anchor + Legacy T1 Fill,13.03,19.92,-39.56,2006-06-01,2007-04-02,1.37,0.83,739,160,21.7,2.23
+6. Clean Data + New Blended Anchor + Fixed T1 Fill,34.22,24.32,-42.84,2006-06-01,2007-04-02,1.67,0.96,648,166,25.6,2.3
