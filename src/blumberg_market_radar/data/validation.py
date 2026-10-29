@@ -16,7 +16,7 @@ def validate_ohlcv(
     frame: pd.DataFrame,
     *,
     tag_microstructure: bool = False,
-    clean_glitches: bool = False,
+    clean_glitches: bool = True,
 ) -> pd.DataFrame:
     """Validate daily OHLCV rows and return a sorted copy.
 

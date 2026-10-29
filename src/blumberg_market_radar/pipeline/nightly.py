@@ -449,11 +449,11 @@ def run_nightly_eod_pipeline(
         bars = fetch_historical_ohlcv(scan_symbols, period="2y", use_cache=True)
         benchmark_bars = fetch_benchmark(period="2y")
 
-    bars = validate_ohlcv(bars)
+    bars = validate_ohlcv(bars, clean_glitches=True)
     if bars.empty:
         raise ValueError("Pipeline failed: No valid OHLCV bars ingested.")
 
-    benchmark_bars = validate_ohlcv(benchmark_bars)
+    benchmark_bars = validate_ohlcv(benchmark_bars, clean_glitches=True)
 
     # Step 2: Ingest Corporate Catalysts
     events_df = get_corporate_events(scan_symbols)

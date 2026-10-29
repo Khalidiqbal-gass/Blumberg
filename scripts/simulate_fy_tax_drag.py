@@ -4,6 +4,7 @@ sys.path.insert(0, 'src')
 import pandas as pd
 import numpy as np
 from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
+from blumberg_market_radar.data.validation import clean_transient_price_spikes
 
 def get_fy(dt):
     dt = pd.to_datetime(dt)
@@ -240,16 +241,9 @@ if __name__ == '__main__':
     bench_df = pd.read_parquet('data/cache/historical_2000_2026/sensex_bench_2000_2026.parquet')
     df = df.sort_values(['symbol', 'date']).reset_index(drop=True)
 
-    df['c_prev'] = df.groupby('symbol')['close'].shift(1)
-    df['c_next'] = df.groupby('symbol')['close'].shift(-1)
-    mask_glitch = ((df['high'] / df['c_prev'] > 2.0) | (df['low'] / df['c_prev'] < 0.5)) & (df['c_next'] / df['c_prev'] >= 0.7) & (df['c_next'] / df['c_prev'] <= 1.4)
-
-    df_clean = df.copy()
-    interp_price = (df_clean.loc[mask_glitch, 'c_prev'] + df_clean.loc[mask_glitch, 'c_next']) / 2.0
-    df_clean.loc[mask_glitch, 'open'] = interp_price
-    df_clean.loc[mask_glitch, 'high'] = interp_price * 1.01
-    df_clean.loc[mask_glitch, 'low'] = interp_price * 0.99
-    df_clean.loc[mask_glitch, 'close'] = interp_price
+    # Use shared institutional validation module for transient price spike repair
+    df_clean, num_repaired = clean_transient_price_spikes(df)
+    print(f'Repaired {num_repaired} transient price spikes using shared validation module.')
 
     print("================================================================================")
     print("RUNNING INSTITUTIONAL FY-BY-FY TAX & REINVESTMENT DRAG SIMULATION (2000-2026)")
