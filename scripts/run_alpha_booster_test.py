@@ -56,7 +56,7 @@ def run_alpha_booster_test():
         statutory_bps_per_side=52.6,
         mode="HYBRID_50_50",
         use_vol_parity=True,
-        use_sector_leadership=True,
+        use_sector_leadership=False,
         tranche2_days=10,
     )
 

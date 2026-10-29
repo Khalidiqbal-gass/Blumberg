@@ -64,7 +64,7 @@ def run_finetuned_audit() -> None:
             entry_mode=mode,
             incubation_days=10,
             use_vol_parity=True,
-            use_sector_leadership=True,
+            use_sector_leadership=False,
         )
 
         res = engine.run_backtest(

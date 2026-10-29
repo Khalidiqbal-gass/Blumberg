@@ -61,7 +61,7 @@ def run_comparative_backtests():
             min_turnover_rs=30_000_000.0,
             mode=mode_id,
             use_vol_parity=True,
-            use_sector_leadership=True,
+            use_sector_leadership=False,
             tranche2_days=7,
         )
         summary = engine.run_backtest(bars_2015, bench_2015, start_date="2015-01-01", end_date="2026-12-31", mode=mode_id)
@@ -100,7 +100,7 @@ def run_comparative_backtests():
                 min_turnover_rs=30_000_000.0,
                 mode=mode_id,
                 use_vol_parity=True,
-                use_sector_leadership=True,
+                use_sector_leadership=False,
                 tranche2_days=10,
             )
             summary = engine.run_backtest(bars_2000, bench_2000, start_date="2000-01-01", end_date="2026-12-31", mode=mode_id)

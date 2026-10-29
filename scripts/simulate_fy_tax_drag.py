@@ -186,9 +186,9 @@ def run_fy_tax_analysis(trades_df, equity_df, with_yield=False, yield_pct=6.5, r
     fy_df = pd.DataFrame(fy_records)
     total_tax_paid = fy_df['total_tax'].sum()
     
-    # Dynamic Compounding Drag Simulation
-    # Replay annual returns with annual tax outflows deducted from equity base
-    # Group equity by FY to get yearly return rate
+    # Dynamic Compounding Drag Simulation (Size-Scaled Replay)
+    # Replay annual returns with annual tax outflows scaled to actual post-tax capital size:
+    # dyn_equity = dyn_equity * growth_ratio - tax_this_fy * (dyn_equity / pre_equity)
     equity_df_copy = equity_df.copy()
     equity_df_copy['fy'] = equity_df_copy.index.map(lambda d: get_fy(d)[0])
     
@@ -197,12 +197,9 @@ def run_fy_tax_analysis(trades_df, equity_df, with_yield=False, yield_pct=6.5, r
     years = (equity_df.index[-1] - equity_df.index[0]).days / 365.25
     pre_tax_cagr = (pre_tax_final / initial_cap) ** (1.0 / years) - 1.0
     
-    # Post-tax capital with dynamic annual tax deduction:
-    # Portfolio equity at start of FY_i = Equity at end of FY_{i-1} - Tax paid for FY_{i-1}
+    # Post-tax capital with size-scaled annual tax deduction:
+    pre_equity = initial_cap
     dyn_equity = initial_cap
-    
-    # Map gross yearly growth ratios
-    yearly_growth = []
     fy_list = list(fy_df['fy'])
     
     for i, fy in enumerate(fy_list):
@@ -214,10 +211,12 @@ def run_fy_tax_analysis(trades_df, equity_df, with_yield=False, yield_pct=6.5, r
             
         tax_this_fy = fy_df.loc[fy_df['fy'] == fy, 'total_tax'].values[0]
         
-        # Grow capital by portfolio return ratio
-        dyn_equity = dyn_equity * growth_ratio
-        # Deduct annual tax outflow
-        dyn_equity = max(10_000.0, dyn_equity - tax_this_fy)
+        pre_equity *= growth_ratio
+        dyn_equity *= growth_ratio
+        
+        # Scale rupee tax by (dyn_equity / pre_equity) to match smaller post-tax compounding capital base
+        scale_ratio = dyn_equity / pre_equity if pre_equity > 0 else 1.0
+        dyn_equity = max(10_000.0, dyn_equity - tax_this_fy * scale_ratio)
         
     post_tax_final = dyn_equity
     post_tax_cagr = (post_tax_final / initial_cap) ** (1.0 / years) - 1.0

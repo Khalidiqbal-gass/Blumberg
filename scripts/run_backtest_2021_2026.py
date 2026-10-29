@@ -73,7 +73,7 @@ def run_2021_2026_backtest():
             mode=mode,
             tranche2_days=t2_days,
             use_vol_parity=True,
-            use_sector_leadership=True,
+            use_sector_leadership=False,
         )
 
         res = engine.run_backtest(

@@ -68,11 +68,11 @@ def run_daily_automation():
         approved_cands, sector_summary, available_slots = apply_sector_cluster_guardrail(
             ranked,
             updated_pipe_df,
-            max_stocks_per_sector=5,
-            max_portfolio_slots=20,
+            max_stocks_per_sector=2,
+            max_portfolio_slots=8,
         )
         new_cands = approved_cands.head(min(5, available_slots)) if available_slots > 0 else approved_cands.head(0)
-        print(f"⚡ Sector Cluster Allocation Status: {sector_summary} | Available Slots: {available_slots}/20")
+        print(f"⚡ Sector Cluster Allocation Status: {sector_summary} | Available Slots: {available_slots}/8")
 
     # 3. Format and Dispatch Alerts
     tg_text = format_telegram_digest(updated_pipe_df, new_cands, sector_summary, available_slots)

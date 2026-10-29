@@ -63,7 +63,7 @@ def main():
         statutory_bps_per_side=52.6,
         use_equal_weight_slots=True,
         cash_yield_pct_p_a=6.5,
-        use_sector_leadership=True,
+        use_sector_leadership=False,
         tranche2_days=7,
     )
 
