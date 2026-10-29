@@ -90,7 +90,7 @@ def run_10_slot_master_audit():
         statutory_bps_per_side=35.0,
         use_equal_weight_slots=True,
         cash_yield_pct_p_a=6.5,
-        use_sector_leadership=True,
+        use_sector_leadership=False,
         tranche2_days=7,
     )
 
@@ -277,7 +277,7 @@ def run_10_slot_master_audit():
             statutory_bps_per_side=stat,
             use_equal_weight_slots=True,
             cash_yield_pct_p_a=6.5,
-            use_sector_leadership=True,
+            use_sector_leadership=False,
             tranche2_days=7,
         )
         res = engine_fric.run_backtest(bars_df, bench_df, start_date="2000-01-01", end_date="2026-10-26")

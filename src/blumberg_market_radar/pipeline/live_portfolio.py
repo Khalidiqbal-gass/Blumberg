@@ -232,8 +232,20 @@ class LivePortfolioManager:
             daily_yield_rs = self.state.cash * self.cash_yield_daily
             self.state.cash += daily_yield_rs
 
+        # Ensure 14-day True Range ATR is computed across historical bars for accurate dynamic stops
+        bars_proc = bars_df.sort_values(["symbol", "date"]).copy()
+        if "atr_14" not in bars_proc.columns and "high" in bars_proc.columns and "low" in bars_proc.columns:
+            prev_close = bars_proc.groupby("symbol")["close"].shift(1)
+            tr1 = bars_proc["high"] - bars_proc["low"]
+            tr2 = (bars_proc["high"] - prev_close).abs()
+            tr3 = (bars_proc["low"] - prev_close).abs()
+            bars_proc["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            bars_proc["atr_14"] = bars_proc.groupby("symbol")["tr"].transform(
+                lambda s: s.rolling(14, min_periods=5).mean()
+            )
+
         # Get latest bar mapping for all symbols
-        bars_latest = bars_df.sort_values("date").groupby("symbol").last()
+        bars_latest = bars_proc.groupby("symbol").last()
 
         # Step A: Evaluate Exits for Active Trades
         symbols_to_close = []
