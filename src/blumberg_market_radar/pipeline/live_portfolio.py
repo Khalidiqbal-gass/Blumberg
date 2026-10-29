@@ -241,7 +241,7 @@ class LivePortfolioManager:
             tr3 = (bars_proc["low"] - prev_close).abs()
             bars_proc["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             bars_proc["atr_14"] = bars_proc.groupby("symbol")["tr"].transform(
-                lambda s: s.rolling(14, min_periods=1).mean()
+                lambda s: s.rolling(14, min_periods=14).mean()
             )
 
         # Get latest bar mapping for all symbols
@@ -261,8 +261,8 @@ class LivePortfolioManager:
             low_p = float(bar["low"])
             high_p = float(bar["high"])
 
-            # Anchor entry price to Tranche 1 breakout price so adding Tranche 2 does not distort ratchet milestones
-            entry_p = float(pos.get("tranche1_price", pos["entry_price"]))
+            # Same anchor as backtest: blended raw entry (friction-free) for milestones, stops and floors
+            entry_p = float(pos["entry_price"])
             prior_peak = float(pos.get("peak_price", entry_p))
             gain_from_entry = (prior_peak / entry_p - 1.0) * 100.0
 
