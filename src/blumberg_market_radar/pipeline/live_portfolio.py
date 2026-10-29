@@ -97,8 +97,8 @@ class LivePortfolioManager:
         initial_capital: float = 1_000_000.0,
         max_slots: int = 8,
         tranche2_days: int = 7,
-        slippage_bps: float = 20.0,
-        statutory_bps: float = 35.0,
+        slippage_bps: float = 50.0,
+        statutory_bps: float = 52.6,
         cash_yield_pct_p_a: float = 6.5,
     ):
         self.state_path = Path(state_path)
@@ -241,7 +241,7 @@ class LivePortfolioManager:
             tr3 = (bars_proc["low"] - prev_close).abs()
             bars_proc["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             bars_proc["atr_14"] = bars_proc.groupby("symbol")["tr"].transform(
-                lambda s: s.rolling(14, min_periods=5).mean()
+                lambda s: s.rolling(14, min_periods=1).mean()
             )
 
         # Get latest bar mapping for all symbols
