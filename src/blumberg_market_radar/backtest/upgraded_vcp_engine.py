@@ -113,6 +113,9 @@ class UpgradedVCPBacktestEngine:
         cash_yield_pct_p_a: float = 6.5,  # Annualized 6.5% liquid fund/T-Bill yield on uninvested cash
         entry_anchor_mode: str = "BLENDED_RAW",  # "BLENDED_RAW" (current standard) or "T1_INITIAL" (legacy ablation)
         t1_blend_mode: str = "RAW_FILL",        # "RAW_FILL" (current standard) or "INVESTED_OVER_SHARES" (legacy ablation)
+        gap_loss_cap_pct: float | None = 20.0,  # Hard-stop gap fill floor (-20%). None = fill at the real open (stress mode)
+        stage5_fill_mode: str = "FLOOR",        # "FLOOR" = fill at -25% trail (optimistic); "CLOSE" = fill at the close that triggered it (realistic)
+        stale_exit_sessions: int | None = 20,   # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -126,6 +129,9 @@ class UpgradedVCPBacktestEngine:
         self.cash_yield_pct_p_a = cash_yield_pct_p_a
         self.entry_anchor_mode = entry_anchor_mode
         self.t1_blend_mode = t1_blend_mode
+        self.gap_loss_cap_pct = gap_loss_cap_pct
+        self.stage5_fill_mode = stage5_fill_mode.upper()
+        self.stale_exit_sessions = stale_exit_sessions
 
         # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
         # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
@@ -142,6 +148,7 @@ class UpgradedVCPBacktestEngine:
         tr2 = (df["high"] - prev_close).abs()
         tr3 = (df["low"] - prev_close).abs()
         df["tr"] = np.maximum(tr1, np.maximum(tr2, tr3))
+        df["prev_close"] = prev_close
 
         df["atr_10"] = df["tr"].rolling(10, min_periods=5).mean()
         df["atr_14"] = df["tr"].rolling(14, min_periods=7).mean()
@@ -263,6 +270,8 @@ class UpgradedVCPBacktestEngine:
         closed_trades: list[UpgradedTrade] = []
         equity_curve: list[dict[str, Any]] = []
         total_friction_paid = 0.0
+        last_px: dict[str, float] = {}   # last known close per held symbol (MTM when a bar is missing)
+        missed_sessions: dict[str, int] = {}
         daily_cash_yield = (
             (1.0 + self.cash_yield_pct_p_a / 100.0) ** (1.0 / 252.0) - 1.0
             if self.cash_yield_pct_p_a > 0.0
@@ -291,7 +300,7 @@ class UpgradedVCPBacktestEngine:
             # Portfolio Mark-to-Market Equity at Open
             mtm_val_open = sum(
                 symbol_data[s].loc[cur_date]["open"] * t.shares
-                if cur_date in symbol_data[s].index else t.invested_capital
+                if cur_date in symbol_data[s].index else last_px.get(s, t.entry_price) * t.shares
                 for s, t in active_trades.items()
             )
             current_equity_open = cash + mtm_val_open
@@ -541,7 +550,29 @@ class UpgradedVCPBacktestEngine:
                 tr = active_trades[sym]
                 s_df = symbol_data[sym]
                 if cur_date not in s_df.index:
+                    missed_sessions[sym] = missed_sessions.get(sym, 0) + 1
+                    if self.stale_exit_sessions is not None and missed_sessions[sym] >= self.stale_exit_sessions:
+                        # Data ended (delisting / long suspension): close at last known price, never carry at entry price
+                        stale_p = last_px.get(sym, tr.entry_price)
+                        sell_friction = stale_p * tr.shares * self.cost_per_side
+                        total_friction_paid += sell_friction
+                        net_proceeds = stale_p * tr.shares - sell_friction
+                        cash += net_proceeds
+                        tr.exit_date = cur_date
+                        tr.exit_price = stale_p
+                        tr.exit_price_net = stale_p * (1.0 - self.cost_per_side)
+                        tr.exit_reason = "STALE_DATA_EXIT (delisted / suspended)"
+                        tr.stage_at_exit = "Data Stale"
+                        tr.peak_gain_pct = (tr.peak_price / tr.entry_price - 1.0) * 100.0
+                        tr.gross_return_pct = (stale_p / tr.entry_price - 1.0) * 100.0
+                        tr.net_return_pct = (tr.exit_price_net / tr.entry_price_with_friction - 1.0) * 100.0
+                        tr.pnl_amount = net_proceeds - tr.invested_capital
+                        tr.calendar_days = (cur_date - tr.entry_date).days
+                        tr.status = "Closed"
+                        closed_trades.append(tr)
+                        symbols_to_close.append(sym)
                     continue
+                missed_sessions[sym] = 0
                 bar = s_df.loc[cur_date]
 
                 # Peak price established prior to today
@@ -573,7 +604,10 @@ class UpgradedVCPBacktestEngine:
                 if tr.is_climax_reached and gain_from_entry >= 100.0:
                     if dip_from_peak <= -25.0:
                         exit_triggered = True
-                        exit_price = min(prior_peak * 0.75, bar["open"])
+                        if self.stage5_fill_mode == "CLOSE":
+                            exit_price = min(prior_peak * 0.75, bar["open"], bar["close"])
+                        else:
+                            exit_price = min(prior_peak * 0.75, bar["open"])
                         exit_reason = "Parabolic Climax Exit (-25% Trail from Doubling Peak)"
                         stage_name = "Stage 5: Climax Exit"
 
@@ -590,7 +624,7 @@ class UpgradedVCPBacktestEngine:
                         stage_name = "Stage 4: Secular Compounding"
                     elif bar["close"] < bar["ema100"] and dip_from_peak <= -20.0:
                         exit_triggered = True
-                        exit_price = min(bar["open"], bar["close"]) if bar["open"] < bar["close"] else bar["close"]
+                        exit_price = bar["close"]  # closing-condition exit executes at the close (same as Stage 1/3)
                         exit_reason = "Secular Trend Ended (100 EMA Break & -20% Drop)"
                         stage_name = "Stage 4: Secular Compounding"
 
@@ -634,7 +668,9 @@ class UpgradedVCPBacktestEngine:
                         exit_triggered = True
                         # Statutory exchange circuit filters cap single-day gap execution at -20% max
                         # (prevents artificial execution on unadjusted corporate action / demerger ticks)
-                        exit_price = max(tr.entry_price * 0.80, min(tr.entry_price * 0.90, bar["open"]))
+                        exit_price = min(tr.entry_price * 0.90, bar["open"])
+                        if self.gap_loss_cap_pct is not None:
+                            exit_price = max(tr.entry_price * (1.0 - self.gap_loss_cap_pct / 100.0), exit_price)
                         exit_reason = "Extreme Circuit Breaker (-10% Hard Stop)"
                         stage_name = "Stage 1: Ignition Defense"
                     elif bar["close"] <= closing_stop:
@@ -660,6 +696,8 @@ class UpgradedVCPBacktestEngine:
                     is_lower_circuit = (
                         bar["open"] == bar["low"]
                         and bar["high"] == bar["low"]  # truly locked: no range at all
+                        and pd.notnull(bar["prev_close"])
+                        and bar["close"] < bar["prev_close"]  # locked DOWN (an upper-circuit lock can always be sold into)
                     )
                     if is_lower_circuit and exit_reason != "Dead Money Time-Stop Exit (30d Stagnation)":
                         # Defer exit to next session — position stays open, no close recorded
@@ -686,7 +724,9 @@ class UpgradedVCPBacktestEngine:
 
                         closed_trades.append(tr)
                         symbols_to_close.append(sym)
-                else:
+                if not exit_triggered:
+                    # Trade survived today's session (or its exit was deferred by a lower circuit):
+                    # update peak price, climax flag and holding period either way
                     # Trade survived today's session: update peak price & climax flag safely
                     if bar["high"] > tr.peak_price:
                         tr.peak_price = bar["high"]
@@ -746,7 +786,11 @@ class UpgradedVCPBacktestEngine:
             curr_mtm = 0.0
             for s, t in active_trades.items():
                 s_df = symbol_data[s]
-                p_curr = s_df.loc[cur_date]["close"] if cur_date in s_df.index else t.entry_price
+                if cur_date in s_df.index:
+                    p_curr = float(s_df.loc[cur_date]["close"])
+                    last_px[s] = p_curr
+                else:
+                    p_curr = last_px.get(s, t.entry_price)
                 curr_mtm += p_curr * t.shares
 
             total_equity = cash + curr_mtm
@@ -772,7 +816,7 @@ class UpgradedVCPBacktestEngine:
             tr.peak_gain_pct = (tr.peak_price / tr.entry_price - 1.0) * 100.0
             tr.gross_return_pct = (exit_p / tr.entry_price - 1.0) * 100.0
             tr.net_return_pct = (tr.exit_price_net / tr.entry_price_with_friction - 1.0) * 100.0
-            tr.pnl_amount = (exit_p * tr.shares) - tr.invested_capital
+            tr.pnl_amount = (exit_p * tr.shares * (1.0 - self.cost_per_side)) - tr.invested_capital
             tr.calendar_days = (terminal_date - tr.entry_date).days
             tr.exit_reason = "ACTIVE WEALTH COMPOUNDER (Holding Today)"
             tr.stage_at_exit = "Active Holding"

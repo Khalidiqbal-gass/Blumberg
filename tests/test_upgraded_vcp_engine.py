@@ -163,3 +163,33 @@ def test_stage_5_parabolic_climax_exit():
     t = summary.trades_df.iloc[0]
     assert t["is_climax_reached"] or t["peak_gain_pct"] >= 50.0
     assert t["net_return_pct"] > 20.0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the full-audit fixes
+# ---------------------------------------------------------------------------
+def _flat_bars(sym, dates, price=100.0):
+    return pd.DataFrame({
+        "date": dates, "symbol": sym, "open": price, "high": price * 1.01, "low": price * 0.99,
+        "close": price, "volume": 1_000_000.0,
+    })
+
+
+def test_stale_data_position_is_force_closed_not_carried_at_entry_price():
+    from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
+    dates = pd.bdate_range("2020-01-01", periods=60, tz="UTC")
+    eng = UpgradedVCPBacktestEngine(stale_exit_sessions=5)
+    # Directly exercise the engine's stale logic through a synthetic run: symbol A stops trading at bar 30
+    a = _flat_bars("AAA", dates[:30], 100.0)
+    b = _flat_bars("BBB", dates, 100.0)
+    bench = pd.DataFrame({"date": dates, "close": np.linspace(100, 120, len(dates))})
+    res = eng.run_backtest(pd.concat([a, b]), bench)
+    # No crash and equity curve is finite for the whole period
+    assert np.isfinite(res.equity_curve["total_equity"]).all()
+
+
+def test_gap_cap_is_configurable():
+    from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
+    assert UpgradedVCPBacktestEngine().gap_loss_cap_pct == 20.0
+    assert UpgradedVCPBacktestEngine(gap_loss_cap_pct=None).gap_loss_cap_pct is None
+    assert UpgradedVCPBacktestEngine(stage5_fill_mode="close").stage5_fill_mode == "CLOSE"

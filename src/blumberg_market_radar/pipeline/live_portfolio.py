@@ -244,6 +244,15 @@ class LivePortfolioManager:
                 lambda s: s.rolling(14, min_periods=14).mean()
             )
 
+        if "prev_close" not in bars_proc.columns:
+            bars_proc["prev_close"] = bars_proc.groupby("symbol")["close"].shift(1)
+        for _span in (20, 50, 100):
+            _col = f"ema{_span}"
+            if _col not in bars_proc.columns:
+                bars_proc[_col] = bars_proc.groupby("symbol")["close"].transform(
+                    lambda s, n=_span: s.ewm(span=n, adjust=False).mean()
+                )
+
         # Get latest bar mapping for all symbols
         bars_latest = bars_proc.groupby("symbol").last()
 
@@ -271,18 +280,24 @@ class LivePortfolioManager:
             exit_reason = ""
             stage_name = pos.get("current_stage", "Stage 1: Ignition Defense")
 
-            # ---------------- STAGE 5: CLIMAX HARVESTING (Peak >= +100%) ----------------
-            if gain_from_entry >= 100.0:
-                stage_name = "Stage 5: Climax Harvesting"
-                floor_price = prior_peak * 0.75
-                pos["profit_floor_price"] = floor_price
-                if low_p <= floor_price:
-                    exit_triggered = True
-                    exit_price = min(floor_price, open_p)
-                    exit_reason = f"Climax Profit Floor Breached (-25% from Peak ₹{prior_peak:.2f})"
+            dip_from_peak = (close_p / prior_peak - 1.0) * 100.0
+            ema20_v = float(bar["ema20"]) if "ema20" in bar and pd.notna(bar["ema20"]) else None
+            ema50_v = float(bar["ema50"]) if "ema50" in bar and pd.notna(bar["ema50"]) else None
+            ema100_v = float(bar["ema100"]) if "ema100" in bar and pd.notna(bar["ema100"]) else None
+            is_climax = bool(pos.get("is_climax_reached", False))
 
-            # ---------------- STAGE 4: SECULAR COMPOUNDER (+50% <= Peak < +100%) ----------------
-            elif 50.0 <= gain_from_entry < 100.0:
+            # Exit ladder mirrors UpgradedVCPBacktestEngine one-for-one (same triggers, same fills).
+            # ---------------- STAGE 5: CLIMAX (needs climax flag AND prior peak >= +100%) ----------------
+            if is_climax and gain_from_entry >= 100.0:
+                stage_name = "Stage 5: Climax Harvesting"
+                pos["profit_floor_price"] = prior_peak * 0.75
+                if dip_from_peak <= -25.0:
+                    exit_triggered = True
+                    exit_price = min(prior_peak * 0.75, open_p)
+                    exit_reason = f"Parabolic Climax Exit (-25% Trail from Peak ₹{prior_peak:.2f})"
+
+            # ---------------- STAGE 4: SECULAR COMPOUNDER (peak >= +50%) ----------------
+            elif gain_from_entry >= 50.0:
                 stage_name = "Stage 4: Secular Compounding"
                 floor_4 = entry_p * 1.25
                 pos["profit_floor_price"] = floor_4
@@ -290,18 +305,27 @@ class LivePortfolioManager:
                     exit_triggered = True
                     exit_price = min(floor_4, open_p)
                     exit_reason = "Secular Profit Floor (+25% Floor Protected)"
+                elif ema100_v is not None and close_p < ema100_v and dip_from_peak <= -20.0:
+                    exit_triggered = True
+                    exit_price = close_p
+                    exit_reason = "Secular Trend Ended (100 EMA Break & -20% Drop)"
 
-            # ---------------- STAGE 3: TREND ACCELERATION (+30% <= Peak < +50%) ----------------
+            # ---------------- STAGE 3: PROGRESSIVE RATCHET (+30% <= peak < +50%) ----------------
             elif 30.0 <= gain_from_entry < 50.0:
                 stage_name = "Stage 3: Trend Momentum"
                 floor_12 = entry_p * 1.12
+                floor_px = max(floor_12, ema50_v) if ema50_v is not None else floor_12
                 pos["profit_floor_price"] = floor_12
                 if low_p <= floor_12:
                     exit_triggered = True
                     exit_price = min(floor_12, open_p)
                     exit_reason = "Ratchet Profit Floor (+12% Locked)"
+                elif close_p < floor_px:
+                    exit_triggered = True
+                    exit_price = min(floor_px, open_p) if open_p < floor_px else close_p
+                    exit_reason = "Ratchet Profit Floor (+12% / 50 EMA Locked)"
 
-            # ---------------- STAGE 2: CAPITAL PRESERVATION (+15% <= Peak < +30%) ----------------
+            # ---------------- STAGE 2: CAPITAL PRESERVATION (+15% <= peak < +30%) ----------------
             elif 15.0 <= gain_from_entry < 30.0:
                 stage_name = "Stage 2: Capital Preservation"
                 be_floor = entry_p * 1.02
@@ -311,7 +335,7 @@ class LivePortfolioManager:
                     exit_price = min(be_floor, open_p)
                     exit_reason = "Breakeven Floor (+2% Profit Locked)"
 
-            # ---------------- STAGE 1: IGNITION DEFENSE (Peak < +15%) ----------------
+            # ---------------- STAGE 1: IGNITION DEFENSE (peak < +15%) ----------------
             else:
                 stage_name = "Stage 1: Ignition Defense"
                 hard_stop = entry_p * 0.90
@@ -319,8 +343,8 @@ class LivePortfolioManager:
                 closing_stop = max(entry_p * 0.92, entry_p - 2.5 * atr_val)
                 pos["stop_loss_price"] = closing_stop
 
-                # Demerger / Corporate Action anomaly check: If single-day drop exceeds 35% without volume explosion,
-                # do not execute panic exit on unadjusted corporate action (e.g. demerger like VEDL).
+                # Demerger / Corporate Action anomaly check (LIVE-ONLY safety): a >35% single-day drop on an
+                # unadjusted corporate action (e.g. VEDL demerger) must not trigger a blind panic exit.
                 is_corp_action_anomaly = (low_p <= entry_p * 0.65) and (prior_peak >= entry_p * 0.95)
 
                 if is_corp_action_anomaly:
@@ -333,14 +357,13 @@ class LivePortfolioManager:
                 elif close_p <= closing_stop:
                     exit_triggered = True
                     exit_price = min(closing_stop, open_p) if open_p < closing_stop else close_p
-                    exit_reason = "Closing Stop-Loss (-8% Threshold)"
-                elif pos["bars_held"] >= 30 and (close_p / entry_p - 1.0) < 0.10:
-                    ema20_val = float(bar["ema20"]) if "ema20" in bar and pd.notna(bar["ema20"]) else None
-                    if ema20_val is None or close_p < ema20_val:
-                        exit_triggered = True
-                        exit_price = close_p
-                        exit_reason = "Dead Money Time-Stop Exit (30d Stagnant Base & Below 20 EMA)"
+                    exit_reason = "Closing Stop-Loss (ATR / -8% Threshold)"
+                elif pos["bars_held"] >= 30 and gain_from_entry < 10.0 and (ema20_v is None or close_p < ema20_v):
+                    exit_triggered = True
+                    exit_price = close_p
+                    exit_reason = "Dead Money Time-Stop Exit (30d Stagnant Base & Below 20 EMA)"
 
+            prev_recorded_price = pos.get("current_price")
             pos["current_stage"] = stage_name
             pos["current_price"] = close_p
             pos["current_gain_pct"] = (close_p / entry_p - 1.0) * 100.0
@@ -348,7 +371,10 @@ class LivePortfolioManager:
 
             if exit_triggered:
                 # Lower circuit check: if stock is locked limit-down, cannot sell today
-                is_lower_circuit = (open_p == low_p and high_p == low_p)  # truly locked: zero range
+                prev_c = float(bar["prev_close"]) if "prev_close" in bar and pd.notna(bar["prev_close"]) else None
+                if prev_c is None and prev_recorded_price:
+                    prev_c = float(prev_recorded_price)  # price recorded at the previous rebalance
+                is_lower_circuit = (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)  # locked DOWN
                 if is_lower_circuit and "Dead Money" not in exit_reason:
                     pos["current_stage"] = f"CIRCUIT_DEFER: {exit_reason}"
                     actions_taken.append(f"⚠️ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
@@ -362,6 +388,13 @@ class LivePortfolioManager:
                 if high_p > prior_peak:
                     pos["peak_price"] = high_p
                     pos["peak_gain_pct"] = (high_p / entry_p - 1.0) * 100.0
+                # Climax flag with bidirectional reset (same rule as backtest)
+                if ema100_v is not None and ema100_v > 0:
+                    dist100 = close_p / ema100_v - 1.0
+                    if dist100 > 0.60:
+                        pos["is_climax_reached"] = True
+                    elif is_climax and dist100 < 0.35:
+                        pos["is_climax_reached"] = False
 
         # Execute Exits
         for sym, exit_p, reason, stg in symbols_to_close:
@@ -402,7 +435,7 @@ class LivePortfolioManager:
                         continue
                     curr_p = float(b["close"])
                     # ONLY if in profit!
-                    if curr_p > float(pos["entry_price"]):
+                    if curr_p > float(pos["entry_price"]) and float(b["low"]) > float(pos["entry_price"]) * 0.92:
                         t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5)
                         if t2_alloc >= 5000.0:
                             t2_friction = t2_alloc * self.cost_per_side

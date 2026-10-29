@@ -1,0 +1,5 @@
+Config,Final_Cap_Cr,Multiple,CAGR_Pct,Max_DD_Pct,DD_Peak_Date,DD_Trough_Date,DD_Peak_Cr,DD_Trough_Cr,Trades,Wins,WinRate_Pct,Profit_Factor,Stale_Exits
+"1. Production Default (gap_cap=20%, stage5=FLOOR, stale=20d)",35.63,356.3,24.51,-41.27,2006-06-01,2007-04-02,1.55,0.91,648,165,25.5,2.3,0
+"2. Stress: Uncapped Gaps (gap_cap=None, stage5=FLOOR, stale=20d)",34.68,346.8,24.38,-41.27,2006-06-01,2007-04-02,1.55,0.91,648,165,25.5,2.22,0
+"3. Stress: Realistic Stage 5 (gap_cap=20%, stage5=CLOSE, stale=20d)",35.52,355.2,24.5,-41.27,2006-06-01,2007-04-02,1.55,0.91,648,165,25.5,2.3,0
+"4. Stress: Worst-Case Combined (gap_cap=None, stage5=CLOSE, stale=20d)",34.58,345.8,24.37,-41.27,2006-06-01,2007-04-02,1.55,0.91,648,165,25.5,2.22,0
