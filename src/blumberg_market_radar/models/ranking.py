@@ -726,7 +726,7 @@ def generate_model_card(
         "feature_importances": (
             feature_importances.to_dict() if feature_importances is not None else {}
         ),
-        "governance_status": "APPROVED_FOR_PAPER_TRACKING",
+        "governance_status": "EXPERIMENTAL_RESEARCH_SANDBOX_ONLY",
     }
 
     # Format Markdown document
@@ -770,7 +770,7 @@ def generate_model_card(
 **Version:** `{card_dict['model_version']}`  
 **Model Family:** Pairwise Learning-to-Rank (LambdaRank via LightGBM)  
 **Evaluated On:** Out-of-Sample Walk-Forward Test Set with 20-Day Embargo Buffer  
-**Status:** `GATE_PASSED — CANDIDATE READY FOR PAPER TRACKING`  
+**Status:** `EXPERIMENTAL — NOT APPROVED FOR PRODUCTION (RESEARCH SANDBOX ONLY)`  
 
 ---
 

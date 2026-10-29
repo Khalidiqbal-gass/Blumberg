@@ -87,7 +87,7 @@ class BacktestSummary:
     yearly_summary: pd.DataFrame
     mode: str = "HYBRID_50_50"
     use_vol_parity: bool = True
-    use_sector_leadership: bool = True
+    use_sector_leadership: bool = False
 
 
 class UpgradedVCPBacktestEngine:
@@ -104,7 +104,7 @@ class UpgradedVCPBacktestEngine:
         mode: str = "HYBRID_50_50",  # "HYBRID_50_50", "LAYER_2_CONFIRMATION", "LAYER_1_FULL"
         entry_mode: str | None = None,
         use_vol_parity: bool = True,  # Alpha Booster: Volatility-parity sizing inverse to ATR%
-        use_sector_leadership: bool = True,  # Alpha Booster: Restrict/boost leading sectors
+        use_sector_leadership: bool = False,  # Deprecated / Disabled by default (sector column absent in historical parquet)
         tranche2_days: int = 7,   # FIX #7: Spec says Day-7 T2 confirmation (was incorrectly 10)
         incubation_days: int | None = None,
         use_equal_weight_slots: bool = True,  # True = 100% active slot allocation (no idle cash drag)
