@@ -322,7 +322,7 @@ class UpgradedVCPBacktestEngine:
                                     # of actual T1 and T2 fill prices, not total_capital / total_shares.
                                     # total_capital/shares was wrong because invested_capital includes
                                     # friction deducted from shares (shares = (alloc - friction) / price).
-                                    t1_fill = tr.tranche1_invested / tr.tranche1_shares if tr.tranche1_shares > 0 else raw_t2
+                                    t1_fill = tr.initial_entry_price if tr.initial_entry_price > 0 else raw_t2  # raw T1 fill, friction-free
                                     t2_fill = raw_t2
                                     t1_w = tr.tranche1_shares / tr.shares  # weight of T1 shares
                                     t2_w = t2_shares / tr.shares            # weight of T2 shares
@@ -538,8 +538,8 @@ class UpgradedVCPBacktestEngine:
 
                 # Peak price established prior to today
                 prior_peak = tr.peak_price
-                ref_entry = tr.initial_entry_price if tr.initial_entry_price > 0 else tr.entry_price
-                gain_from_entry = (prior_peak / ref_entry - 1.0) * 100.0
+                # Single anchor (blended raw entry) for milestones, stops and floors, identical to live
+                gain_from_entry = (prior_peak / tr.entry_price - 1.0) * 100.0
                 dip_from_peak = (bar["close"] / prior_peak - 1.0) * 100.0
 
                 exit_triggered = False
