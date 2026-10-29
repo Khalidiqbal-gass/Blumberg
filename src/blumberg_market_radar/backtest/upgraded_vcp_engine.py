@@ -89,6 +89,7 @@ class BacktestSummary:
     mode: str = "HYBRID_50_50"
     use_vol_parity: bool = True
     use_sector_leadership: bool = False
+    benchmark_cagr_pct: float = 0.0
 
 
 class UpgradedVCPBacktestEngine:
@@ -745,6 +746,7 @@ class UpgradedVCPBacktestEngine:
                 "total_equity": total_equity,
                 "active_slots": len(active_trades),
                 "nifty_close": bench_close_dict.get(cur_date, np.nan),
+                "benchmark_close": bench_close_dict.get(cur_date, np.nan),
             })
 
         # Close remaining open positions at terminal date
@@ -872,4 +874,5 @@ class UpgradedVCPBacktestEngine:
             mode=exec_mode,
             use_vol_parity=self.use_vol_parity,
             use_sector_leadership=self.use_sector_leadership,
+            benchmark_cagr_pct=nifty_cagr,
         )
