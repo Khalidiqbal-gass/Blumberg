@@ -193,3 +193,17 @@ def test_gap_cap_is_configurable():
     assert UpgradedVCPBacktestEngine().gap_loss_cap_pct == 20.0
     assert UpgradedVCPBacktestEngine(gap_loss_cap_pct=None).gap_loss_cap_pct is None
     assert UpgradedVCPBacktestEngine(stage5_fill_mode="close").stage5_fill_mode == "CLOSE"
+
+
+def test_engine_cleans_single_bar_glitches_by_default():
+    from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
+    dates = pd.bdate_range("2020-01-01", periods=40, tz="UTC")
+    df = _flat_bars("AAA", dates, 100.0)
+    df.loc[20, ["open", "high", "low", "close"]] = [100.0, 450.0, 100.0, 100.0]  # one-bar bad tick (high 4.5x, reverts)
+    bench = pd.DataFrame({"date": dates, "close": np.linspace(100, 110, len(dates))})
+    eng = UpgradedVCPBacktestEngine()
+    eng.run_backtest(df, bench)
+    assert eng.glitch_bars_repaired == 1
+    eng_off = UpgradedVCPBacktestEngine(clean_glitches=False)
+    eng_off.run_backtest(df, bench)
+    assert eng_off.glitch_bars_repaired == 0

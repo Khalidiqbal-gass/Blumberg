@@ -115,7 +115,8 @@ class UpgradedVCPBacktestEngine:
         t1_blend_mode: str = "RAW_FILL",        # "RAW_FILL" (current standard) or "INVESTED_OVER_SHARES" (legacy ablation)
         gap_loss_cap_pct: float | None = 20.0,  # Hard-stop gap fill floor (-20%). None = fill at the real open (stress mode)
         stage5_fill_mode: str = "FLOOR",        # "FLOOR" = fill at -25% trail (optimistic); "CLOSE" = fill at the close that triggered it (realistic)
-        stale_exit_sessions: int | None = 20,   # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
+        stale_exit_sessions: int | None = 20,
+        clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does   # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -132,6 +133,7 @@ class UpgradedVCPBacktestEngine:
         self.gap_loss_cap_pct = gap_loss_cap_pct
         self.stage5_fill_mode = stage5_fill_mode.upper()
         self.stale_exit_sessions = stale_exit_sessions
+        self.clean_glitches = clean_glitches
 
         # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
         # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
@@ -218,6 +220,10 @@ class UpgradedVCPBacktestEngine:
 
         bars = bars_df.copy()
         bars["date"] = pd.to_datetime(bars["date"], utc=True)
+        self.glitch_bars_repaired = 0
+        if self.clean_glitches:
+            from blumberg_market_radar.data.validation import clean_transient_price_spikes
+            bars, self.glitch_bars_repaired = clean_transient_price_spikes(bars)
         bench = bench_df.copy()
         bench["date"] = pd.to_datetime(bench["date"], utc=True)
 

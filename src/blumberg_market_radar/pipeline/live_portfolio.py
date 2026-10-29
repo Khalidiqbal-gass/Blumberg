@@ -86,6 +86,7 @@ class LivePortfolioState:
     daily_equity_history: list[dict] = field(default_factory=list)
     last_rebalance_date: str = ""
     created_at: str = ""
+    pending_entries: list[dict] = field(default_factory=list)  # signals to be filled at the NEXT session open
 
 
 class LivePortfolioManager:
@@ -124,6 +125,7 @@ class LivePortfolioManager:
                     daily_equity_history=data.get("daily_equity_history", []),
                     last_rebalance_date=data.get("last_rebalance_date", ""),
                     created_at=data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    pending_entries=data.get("pending_entries", []),
                 )
             except Exception as exc:
                 logger.warning(f"Could not parse state file: {exc}. Starting fresh.")
@@ -256,11 +258,97 @@ class LivePortfolioManager:
         # Get latest bar mapping for all symbols
         bars_latest = bars_proc.groupby("symbol").last()
 
-        # Step A: Evaluate Exits for Active Trades
+        def _bar_today(sym_: str):
+            """Latest bar for sym_ if (and only if) it is today's session, else None."""
+            if sym_ not in bars_latest.index:
+                return None
+            b_ = bars_latest.loc[sym_]
+            if "date" in b_.index and pd.Timestamp(b_["date"]).strftime("%Y-%m-%d") != today_date:
+                return None
+            return b_
+
+        # Step 0: Fill orders queued yesterday at TODAY'S OPEN (identical to backtest: signal at close D, fill at open D+1).
+        # Cash/slots are those available before today's exits (T+1 settlement), exactly like the engine.
+        fills_today: set[str] = set()
+        if not is_same_day_rerun:
+            # 0a. Tranche 2 (flagged eligible at yesterday's close) fills at today's open
+            for sym, pos in list(self.state.active_positions.items()):
+                if pos.get("tranche2_eligible") and not pos.get("tranche2_active", False):
+                    pos["tranche2_eligible"] = False
+                    b = _bar_today(sym)
+                    if b is None or float(b["high"]) == float(b["low"]):  # no bar / upper-circuit lock
+                        continue
+                    raw_t2 = float(b["open"])
+                    t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5)
+                    if t2_alloc < 2500.0:
+                        continue
+                    t2_shares = (t2_alloc * (1.0 - self.cost_per_side)) / raw_t2
+                    self.state.cash -= t2_alloc
+                    t1_shares = float(pos["shares"])
+                    t1_price = float(pos.get("tranche1_price", pos["entry_price"]))
+                    total_shares = t1_shares + t2_shares
+                    pos["shares"] = total_shares
+                    pos["invested_capital"] = float(pos["invested_capital"]) + t2_alloc
+                    pos["entry_price"] = (t1_price * t1_shares + raw_t2 * t2_shares) / total_shares
+                    pos["entry_price_with_friction"] = pos["entry_price"] * (1.0 + self.cost_per_side)
+                    pos["tranche2_active"] = True
+                    pos["tranche2_date"] = today_date
+                    pos["tranche2_shares"] = t2_shares
+                    pos["tranche2_price"] = raw_t2
+                    actions_taken.append(f"🟢 TRANCHE 2 FILLED: {sym} +{t2_shares:.1f} shs @ open ₹{raw_t2:.2f} (Confirmed Winner)")
+
+            # 0b. Tranche 1 entries queued yesterday
+            queued = list(self.state.pending_entries)
+            self.state.pending_entries = []
+            if queued:
+                eq_open = self.state.cash + sum(
+                    float(p_["shares"]) * float(bars_latest.loc[s_]["open"]) if s_ in bars_latest.index else float(p_["invested_capital"])
+                    for s_, p_ in self.state.active_positions.items()
+                )
+                slot_cap = eq_open / self.max_slots
+                free_slots = max(0, self.max_slots - len(self.state.active_positions))
+                for q in queued:
+                    qsym = q["symbol"]
+                    if free_slots <= 0 or self.state.cash < 2500.0:
+                        break
+                    if qsym in self.state.active_positions:
+                        continue
+                    b = _bar_today(qsym)
+                    if b is None:
+                        # Not traded today (holiday/suspension): keep the order only for a few sessions
+                        age = (pd.Timestamp(today_date) - pd.Timestamp(q["signal_date"])).days
+                        if age <= 5:
+                            self.state.pending_entries.append(q)
+                        continue
+                    if float(b["high"]) == float(b["low"]):  # upper-circuit lock: cannot buy
+                        actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at circuit, no entry")
+                        continue
+                    raw_entry = float(b["open"])
+                    t1_alloc = min(self.state.cash, slot_cap * 0.5)
+                    if t1_alloc < 2500.0:
+                        continue
+                    t1_shares = (t1_alloc * (1.0 - self.cost_per_side)) / raw_entry
+                    self.state.cash -= t1_alloc
+                    pos_obj = LiveTradePosition(
+                        symbol=qsym, entry_date=today_date, shares=t1_shares, invested_capital=t1_alloc,
+                        entry_price=raw_entry, entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
+                        current_price=raw_entry, peak_price=max(raw_entry, float(b["high"])),
+                        current_gain_pct=0.0, peak_gain_pct=0.0, unrealized_pnl_rs=0.0,
+                        target_slot_capital=slot_cap, tranche1_shares=t1_shares, tranche1_price=raw_entry,
+                        current_stage="Stage 1: Ignition Defense", stop_loss_price=raw_entry * 0.92,
+                        profit_floor_price=0.0, bars_held=0, sector=str(q.get("sector", "Diversified")),
+                        selection_reason=str(q.get("selection_reason", "VCP Base Squeeze")),
+                    )
+                    self.state.active_positions[qsym] = asdict(pos_obj)
+                    fills_today.add(qsym)
+                    free_slots -= 1
+                    actions_taken.append(f"🚀 ENTRY FILLED (Tranche 1): {qsym} {t1_shares:.1f} shs @ open ₹{raw_entry:.2f} (Invested: ₹{t1_alloc:,.0f})")
+
+        # Step A: Evaluate Exits for Active Trades (positions opened this morning are not evaluated today, as in the engine)
         symbols_to_close = []
         for sym, pos in list(self.state.active_positions.items()):
-            if not is_same_day_rerun:
-                pos["bars_held"] = pos.get("bars_held", 0) + 1
+            if sym in fills_today:
+                continue
             if sym not in bars_latest.index:
                 continue
 
@@ -285,6 +373,11 @@ class LivePortfolioManager:
             ema50_v = float(bar["ema50"]) if "ema50" in bar and pd.notna(bar["ema50"]) else None
             ema100_v = float(bar["ema100"]) if "ema100" in bar and pd.notna(bar["ema100"]) else None
             is_climax = bool(pos.get("is_climax_reached", False))
+
+            # Tranche 2 eligibility (decided at today's close, filled at tomorrow's open) - same rule as the engine
+            if (not pos.get("tranche2_active", False)) and pos.get("bars_held", 0) >= (self.tranche2_days - 1):
+                if close_p > entry_p and low_p > entry_p * 0.92:
+                    pos["tranche2_eligible"] = True
 
             # Exit ladder mirrors UpgradedVCPBacktestEngine one-for-one (same triggers, same fills).
             # ---------------- STAGE 5: CLIMAX (needs climax flag AND prior peak >= +100%) ----------------
@@ -348,8 +441,16 @@ class LivePortfolioManager:
                 is_corp_action_anomaly = (low_p <= entry_p * 0.65) and (prior_peak >= entry_p * 0.95)
 
                 if is_corp_action_anomaly:
-                    logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
-                    actions_taken.append(f"⚠️ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Automated exit halted for audit.")
+                    if not is_same_day_rerun:
+                        pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
+                    if int(pos.get("anomaly_days", 0)) >= 3:
+                        # A genuine crash must not be held forever just because it looks like an unadjusted corporate action
+                        exit_triggered = True
+                        exit_price = close_p
+                        exit_reason = "Unresolved >35% Drop (3 sessions) - forced exit"
+                    else:
+                        logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
+                        actions_taken.append(f"⚠️ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Auto-exit halted for audit; forced exit after 3 sessions.")
                 elif low_p <= hard_stop:
                     exit_triggered = True
                     exit_price = min(hard_stop, open_p)
@@ -377,6 +478,8 @@ class LivePortfolioManager:
                 is_lower_circuit = (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)  # locked DOWN
                 if is_lower_circuit and "Dead Money" not in exit_reason:
                     pos["current_stage"] = f"CIRCUIT_DEFER: {exit_reason}"
+                    if not is_same_day_rerun:
+                        pos["bars_held"] = pos.get("bars_held", 0) + 1
                     actions_taken.append(f"⚠️ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
                     if high_p > prior_peak:
                         pos["peak_price"] = high_p
@@ -385,6 +488,8 @@ class LivePortfolioManager:
                     symbols_to_close.append((sym, exit_price, exit_reason, stage_name))
             else:
                 # Update peak only if trade survived session
+                if not is_same_day_rerun:
+                    pos["bars_held"] = pos.get("bars_held", 0) + 1
                 if high_p > prior_peak:
                     pos["peak_price"] = high_p
                     pos["peak_gain_pct"] = (high_p / entry_p - 1.0) * 100.0
@@ -425,95 +530,26 @@ class LivePortfolioManager:
             del self.state.active_positions[sym]
             actions_taken.append(f"🔴 SELL: {sym} exited at ₹{exit_p:.2f} ({net_ret:+.1f}%) | Reason: {reason}")
 
-        # Step B: Process Tranche 2 Additions (Day 7+ in Profit)
-        for sym, pos in list(self.state.active_positions.items()):
-            if not pos.get("tranche2_active", False) and pos.get("bars_held", 0) >= self.tranche2_days:
-                if sym in bars_latest.index:
-                    b = bars_latest.loc[sym]
-                    # Upper circuit check
-                    if (float(b["high"]) == float(b["low"])) or (float(b["open"]) == float(b["high"]) and float(b["high"]) == float(b["low"])):
-                        continue
-                    curr_p = float(b["close"])
-                    # ONLY if in profit!
-                    if curr_p > float(pos["entry_price"]) and float(b["low"]) > float(pos["entry_price"]) * 0.92:
-                        t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5)
-                        if t2_alloc >= 5000.0:
-                            t2_friction = t2_alloc * self.cost_per_side
-                            t2_shares = (t2_alloc - t2_friction) / curr_p
-                            self.state.cash -= t2_alloc
-
-                            t1_shares = float(pos["shares"])
-                            t1_invested = float(pos["invested_capital"])
-                            t1_price = float(pos.get("tranche1_price", pos["entry_price"]))
-                            total_shares = t1_shares + t2_shares
-
-                            pos["shares"] = total_shares
-                            pos["invested_capital"] = t1_invested + t2_alloc
-                            pos["entry_price"] = (t1_price * (t1_shares / total_shares)) + (curr_p * (t2_shares / total_shares))
-                            pos["entry_price_with_friction"] = pos["entry_price"] * (1.0 + self.cost_per_side)
-                            pos["tranche2_active"] = True
-                            pos["tranche2_date"] = today_date
-                            pos["tranche2_shares"] = t2_shares
-                            pos["tranche2_price"] = curr_p
-                            actions_taken.append(f"🟢 TRANCHE 2 ADDED: {sym} +{t2_shares:.1f} shs @ ₹{curr_p:.2f} (Confirmed Winner!)")
-
-        # Step C: Process New Entries (Tranche 1 - 50% Slot Allocation)
-        current_equity = self.state.cash + sum(
-            p["shares"] * bars_latest.loc[s]["close"] if s in bars_latest.index else p["invested_capital"]
-            for s, p in self.state.active_positions.items()
-        )
-        slot_target_capital = current_equity / self.max_slots
-        available_slots = max(0, self.max_slots - len(self.state.active_positions))
-
-        if regime_ok and available_slots > 0 and not candidates_df.empty:
+        # Step C: Queue new signals. They are FILLED at tomorrow's open (never at the signal-day close,
+        # which is unattainable and not what the backtest assumes).
+        available_slots = max(0, self.max_slots - len(self.state.active_positions) - len(self.state.pending_entries))
+        queued_syms = {q["symbol"] for q in self.state.pending_entries}
+        if (not is_same_day_rerun) and regime_ok and available_slots > 0 and candidates_df is not None and not candidates_df.empty:
             for _, row in candidates_df.iterrows():
-                if available_slots <= 0 or self.state.cash < 10000.0:
+                if available_slots <= 0:
                     break
-
                 sym = str(row["symbol"]).upper().replace(".NS", "").replace(".BO", "").strip()
-                if sym in self.state.active_positions:
+                if sym in self.state.active_positions or sym in queued_syms or sym not in bars_latest.index:
                     continue
-
-                if sym not in bars_latest.index:
-                    continue
-
-                bar = bars_latest.loc[sym]
-                # Upper circuit check: true upper circuit when high == low or open == high == low
-                if (float(bar["high"]) == float(bar["low"])) or (float(bar["open"]) == float(bar["high"]) and float(bar["high"]) == float(bar["low"])):
-                    continue
-                fill_price = float(bar["close"])
-
-                t1_alloc = min(self.state.cash, slot_target_capital * 0.5)
-                if t1_alloc >= 5000.0:
-                    t1_friction = t1_alloc * self.cost_per_side
-                    t1_shares = (t1_alloc - t1_friction) / fill_price
-                    self.state.cash -= t1_alloc
-
-                    pos_obj = LiveTradePosition(
-                        symbol=sym,
-                        entry_date=today_date,
-                        shares=t1_shares,
-                        invested_capital=t1_alloc,
-                        entry_price=fill_price,
-                        entry_price_with_friction=fill_price * (1.0 + self.cost_per_side),
-                        current_price=fill_price,
-                        peak_price=fill_price,
-                        current_gain_pct=0.0,
-                        peak_gain_pct=0.0,
-                        unrealized_pnl_rs=0.0,
-                        target_slot_capital=slot_target_capital,
-                        tranche1_shares=t1_shares,
-                        tranche1_price=fill_price,
-                        current_stage="Stage 1: Ignition Defense",
-                        stop_loss_price=fill_price * 0.92,
-                        profit_floor_price=0.0,
-                        bars_held=1,
-                        sector=str(row.get("sector", "Diversified")),
-                        selection_reason=str(row.get("selection_reason", row.get("primary_driver", "VCP Base Squeeze"))),
-                    )
-                    self.state.active_positions[sym] = asdict(pos_obj)
-                    available_slots -= 1
-                    actions_taken.append(f"🚀 NEW ENTRY (Tranche 1): {sym} {t1_shares:.1f} shs @ ₹{fill_price:.2f} (Invested: ₹{t1_alloc:,.0f})")
+                self.state.pending_entries.append({
+                    "symbol": sym,
+                    "signal_date": today_date,
+                    "sector": str(row.get("sector", "Diversified")),
+                    "selection_reason": str(row.get("selection_reason", row.get("primary_driver", "VCP Base Squeeze"))),
+                })
+                queued_syms.add(sym)
+                available_slots -= 1
+                actions_taken.append(f"📝 BUY ORDER QUEUED: {sym} (fills at next session open)")
 
         # Step D: Final Mark to Market & Save
         final_summary = self.get_summary(bars_latest["close"].to_dict())
