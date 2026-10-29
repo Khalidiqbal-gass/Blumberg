@@ -879,9 +879,9 @@ Ranked contribution of multi-factor signals to the LambdaRank model:
 
 | Stakeholder Role | Verification Method | Status | Date |
 | :--- | :--- | :---: | :---: |
-| **Lead ML Ranking Engineer** | Out-of-sample walk-forward validation & NDCG verification | `APPROVED` | {card_dict['created_date']} |
-| **Quantitative Risk Officer** | Embargo buffer verification & circuit failure mode review | `APPROVED` | {card_dict['created_date']} |
-| **Product Governance Lead** | Phase 6 acceptance criteria compliance check | `APPROVED` | {card_dict['created_date']} |
+| **ML Research Module** | Out-of-sample walk-forward validation & NDCG verification | `EXPERIMENTAL - PROTOTYPE` | {card_dict['created_date']} |
+| **Quantitative Engine** | Active execution engine link status | `DISCONNECTED - ENGINE USES RS_SCORE` | {card_dict['created_date']} |
+| **Production Status** | Live trading & Backtest gate check | `RESEARCH SANDBOX ONLY` | {card_dict['created_date']} |
 """
 
     out_file = Path(output_path)

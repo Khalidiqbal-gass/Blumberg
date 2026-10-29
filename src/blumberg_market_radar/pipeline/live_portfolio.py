@@ -302,7 +302,8 @@ class LivePortfolioManager:
             else:
                 stage_name = "Stage 1: Ignition Defense"
                 hard_stop = entry_p * 0.90
-                closing_stop = entry_p * 0.92
+                atr_val = float(bar["atr_14"]) if ("atr_14" in bar and pd.notna(bar["atr_14"])) else close_p * 0.03
+                closing_stop = max(entry_p * 0.92, entry_p - 2.5 * atr_val)
                 pos["stop_loss_price"] = closing_stop
 
                 # Demerger / Corporate Action anomaly check: If single-day drop exceeds 35% without volume explosion,
