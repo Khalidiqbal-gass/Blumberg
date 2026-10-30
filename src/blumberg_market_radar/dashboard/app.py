@@ -168,7 +168,20 @@ def load_market_data(
             except Exception as exc:
                 pass
 
-        bars = fetch_historical_ohlcv(universe, period="1y", data_source="angel_one")
+        # If cache read fails or is absent, attempt live connection if active, otherwise use fast offline dataset for large catalogs
+        try:
+            from blumberg_market_radar.connectors.angel_one import get_angel_connector
+            conn = get_angel_connector()
+            is_conn = getattr(conn, "is_connected", False)
+        except Exception:
+            is_conn = False
+
+        if is_conn:
+            bars = fetch_historical_ohlcv(universe, period="1y", data_source="angel_one")
+        elif len(universe) > 100:
+            bars = generate_synthetic_universe(universe, num_days=num_days)
+        else:
+            bars = fetch_historical_ohlcv(universe, period="1y", data_source="yfinance")
         bench = fetch_benchmark(period="1y", data_source="angel_one")
     elif mode == "Live Market Feed (NSE / Yahoo)":
         bars = fetch_historical_ohlcv(universe, period="1y", data_source="yfinance")

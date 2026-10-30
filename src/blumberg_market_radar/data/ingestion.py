@@ -695,9 +695,21 @@ def fetch_historical_ohlcv(
     frames: list[pd.DataFrame] = []
     logger.info(f"Downloading historical data for {len(symbols)} symbols...")
 
+    # Ensure symbols for Yahoo Finance carry the proper .NS (or .BO) exchange suffix
+    yf_symbol_map: dict[str, str] = {}
+    for sym in symbols:
+        clean = _clean_symbol(sym)
+        if sym.endswith(".NS") or sym.endswith(".BO"):
+            yf_ticker = sym
+        else:
+            yf_ticker = f"{sym}.NS"
+        yf_symbol_map[yf_ticker] = clean
+
+    yf_tickers = list(yf_symbol_map.keys())
+
     try:
         raw_data = yf.download(
-            tickers=list(symbols),
+            tickers=yf_tickers,
             period=period,
             interval="1d",
             group_by="ticker",
@@ -705,9 +717,9 @@ def fetch_historical_ohlcv(
             progress=False,
         )
 
-        for sym in symbols:
+        for yf_ticker, clean_sym in yf_symbol_map.items():
             try:
-                sub_df = raw_data[sym] if len(symbols) > 1 else raw_data
+                sub_df = raw_data[yf_ticker] if len(yf_tickers) > 1 else raw_data
                 if sub_df is None or sub_df.empty:
                     continue
 
@@ -715,7 +727,6 @@ def fetch_historical_ohlcv(
                 sub_df.columns = [str(c).lower().replace(" ", "_") for c in sub_df.columns]
 
                 date_col = "date" if "date" in sub_df.columns else sub_df.columns[0]
-                clean_sym = _clean_symbol(sym)
 
                 renamed = pd.DataFrame({
                     "date": pd.to_datetime(sub_df[date_col], utc=True),
@@ -726,12 +737,26 @@ def fetch_historical_ohlcv(
                     "close": pd.to_numeric(sub_df["close"], errors="coerce"),
                     "volume": pd.to_numeric(sub_df["volume"], errors="coerce"),
                 })
-                renamed = renamed.dropna(subset=["close", "volume"])
-                renamed = renamed[renamed["volume"] > 0]
-                if not renamed.empty:
+                # Drop rows with any NaN in OHLCV columns
+                renamed = renamed.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+                # Ensure strictly positive prices and non-negative volume
+                renamed = renamed[
+                    (renamed["open"] > 0)
+                    & (renamed["high"] > 0)
+                    & (renamed["low"] > 0)
+                    & (renamed["close"] > 0)
+                    & (renamed["volume"] >= 0)
+                ]
+                # Enforce candle consistency (high >= max(open, close), low <= min(open, close))
+                renamed["high"] = np.maximum(renamed["high"], np.maximum(renamed["open"], renamed["close"]))
+                renamed["low"] = np.minimum(renamed["low"], np.minimum(renamed["open"], renamed["close"]))
+                # Deduplicate symbol/date rows
+                renamed = renamed.drop_duplicates(subset=["symbol", "date"], keep="last")
+
+                if len(renamed) >= 2:
                     frames.append(renamed)
             except Exception as sym_err:
-                logger.debug(f"Could not parse symbol {sym}: {sym_err}")
+                logger.debug(f"Could not parse symbol {yf_ticker}: {sym_err}")
 
     except Exception as fetch_err:
         logger.warning(f"Live market data fetch encountered error: {fetch_err}. Using fallback.")
@@ -748,7 +773,37 @@ def fetch_historical_ohlcv(
         return synthetic_df
 
     combined = pd.concat(frames, ignore_index=True)
-    validated = validate_ohlcv(combined, clean_glitches=True)
+    combined = combined.drop_duplicates(subset=["symbol", "date"], keep="last")
+    combined = combined.sort_values(["symbol", "date"], kind="stable").reset_index(drop=True)
+
+    try:
+        validated = validate_ohlcv(combined, clean_glitches=True)
+    except Exception as val_err:
+        logger.warning(f"validate_ohlcv raised: {val_err}. Sanitizing combined dataframe...")
+        clean_mask = (
+            combined["date"].notna()
+            & combined["open"].notna()
+            & combined["high"].notna()
+            & combined["low"].notna()
+            & combined["close"].notna()
+            & combined["volume"].notna()
+            & (combined["open"] > 0)
+            & (combined["high"] > 0)
+            & (combined["low"] > 0)
+            & (combined["close"] > 0)
+            & (combined["volume"] >= 0)
+        )
+        sanitized = combined[clean_mask].copy()
+        sanitized["high"] = np.maximum(sanitized["high"], np.maximum(sanitized["open"], sanitized["close"]))
+        sanitized["low"] = np.minimum(sanitized["low"], np.minimum(sanitized["open"], sanitized["close"]))
+        sanitized = sanitized.drop_duplicates(subset=["symbol", "date"], keep="last")
+        sanitized = sanitized.sort_values(["symbol", "date"], kind="stable").reset_index(drop=True)
+        try:
+            validated = validate_ohlcv(sanitized, clean_glitches=False)
+        except Exception as fallback_err:
+            logger.error(f"validate_ohlcv failed after sanitization: {fallback_err}. Falling back to synthetic.")
+            synthetic_df = generate_synthetic_universe(symbols, num_days=300)
+            return synthetic_df
 
     if use_cache:
         try:
