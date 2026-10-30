@@ -216,3 +216,10 @@ def test_liquidity_cap_limits_fill_size():
     assert eng._liquidity_cap(bar) == 2_000_000.0
     assert UpgradedVCPBacktestEngine(max_pct_of_adv=None)._liquidity_cap(bar) == float("inf")
     assert eng._liquidity_cap(pd.Series({"adv_20": float("nan")})) == float("inf")
+
+
+def test_dd_brake_is_off_by_default_and_configurable():
+    from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
+    assert UpgradedVCPBacktestEngine().dd_brake_pct is None
+    e = UpgradedVCPBacktestEngine(dd_brake_pct=30.0)
+    assert e.dd_brake_pct == 30.0 and e.dd_resume_pct == 15.0

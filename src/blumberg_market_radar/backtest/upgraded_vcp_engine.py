@@ -115,9 +115,11 @@ class UpgradedVCPBacktestEngine:
         t1_blend_mode: str = "RAW_FILL",        # "RAW_FILL" (current standard) or "INVESTED_OVER_SHARES" (legacy ablation)
         gap_loss_cap_pct: float | None = 20.0,  # Hard-stop gap fill floor (-20%). None = fill at the real open (stress mode)
         stage5_fill_mode: str = "FLOOR",        # "FLOOR" = fill at -25% trail (optimistic); "CLOSE" = fill at the close that triggered it (realistic)
-        stale_exit_sessions: int | None = 20,
+        stale_exit_sessions: int | None = 20,  # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
+        dd_brake_pct: float | None = None,   # experimental: pause NEW entries while equity is this % below its peak
+        dd_resume_pct: float | None = None,  # resume when drawdown recovers to this % (default: half of dd_brake_pct)
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg daily turnover (None = unlimited, legacy optimism)
-        clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does   # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
+        clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -136,6 +138,8 @@ class UpgradedVCPBacktestEngine:
         self.stale_exit_sessions = stale_exit_sessions
         self.clean_glitches = clean_glitches
         self.max_pct_of_adv = max_pct_of_adv
+        self.dd_brake_pct = dd_brake_pct
+        self.dd_resume_pct = dd_resume_pct if dd_resume_pct is not None else (dd_brake_pct / 2.0 if dd_brake_pct else None)
 
         # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
         # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
@@ -288,6 +292,8 @@ class UpgradedVCPBacktestEngine:
         closed_trades: list[UpgradedTrade] = []
         equity_curve: list[dict[str, Any]] = []
         total_friction_paid = 0.0
+        eq_peak = self.initial_capital
+        brake_on = False
         last_px: dict[str, float] = {}   # last known close per held symbol (MTM when a bar is missing)
         missed_sessions: dict[str, int] = {}
         daily_cash_yield = (
@@ -323,6 +329,13 @@ class UpgradedVCPBacktestEngine:
             )
             current_equity_open = cash + mtm_val_open
             max_slot_capital = current_equity_open / self.max_slots
+            if self.dd_brake_pct:
+                eq_peak = max(eq_peak, current_equity_open)
+                dd_now = (current_equity_open / eq_peak - 1.0) * 100.0
+                if not brake_on and dd_now <= -self.dd_brake_pct:
+                    brake_on = True
+                elif brake_on and dd_now >= -self.dd_resume_pct:
+                    brake_on = False
 
             # ---------------------------------------------------------
             # A. Process Tranche 2 Additions for HYBRID_50_50 at Open
@@ -417,7 +430,7 @@ class UpgradedVCPBacktestEngine:
             # ---------------------------------------------------------
             # C. Process New Signals from prev_date
             # ---------------------------------------------------------
-            if orig_idx > 0 and regime_ok:
+            if orig_idx > 0 and regime_ok and not brake_on:
                 candidates: list[dict[str, Any]] = []
                 for sym, s_df in symbol_data.items():
                     if sym in active_trades or sym in watchlist_l2:
