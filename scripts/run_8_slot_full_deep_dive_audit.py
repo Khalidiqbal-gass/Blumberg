@@ -42,7 +42,7 @@ BENCH_PARQUET = DATA_CACHE / "sensex_bench_2000_2026.parquet"
 
 def main():
     print("=" * 115)
-    print("   BLUMBERG QUANTITATIVE SYSTEM â€” 8-SLOT SWEET SPOT DEEP DIVE AUDIT (2000 - 2026)")
+    print("   BLUMBERG QUANTITATIVE SYSTEM — 8-SLOT SWEET SPOT DEEP DIVE AUDIT (2000 - 2026)")
     print("=" * 115)
 
     if not BARS_PARQUET.exists() or not BENCH_PARQUET.exists():
@@ -117,24 +117,24 @@ def main():
     print(f"Total Friction Paid (Taxes/Slip): Rs {res_26.total_friction_paid:,.2f}")
     print("-" * 115)
     print(f"Total Completed Trades:        {total_trades}")
-    print(f"  â€¢ Winning Trades:            {wins_count:>4} ({win_rate:.2f}%)   --> Total Gross Profit: +Rs {gross_profit_rs:,.2f}")
-    print(f"  â€¢ Losing Trades (Total):     {loss_count:>4} ({100-win_rate:.2f}%) --> Total Gross Loss:   -Rs {abs(gross_loss_rs):,.2f}")
-    print(f"  â€¢ Net Realized Trading PnL:                                     --> Net Realized PnL:  +Rs {net_pnl_rs:,.2f}")
+    print(f"  • Winning Trades:            {wins_count:>4} ({win_rate:.2f}%)   --> Total Gross Profit: +Rs {gross_profit_rs:,.2f}")
+    print(f"  • Losing Trades (Total):     {loss_count:>4} ({100-win_rate:.2f}%) --> Total Gross Loss:   -Rs {abs(gross_loss_rs):,.2f}")
+    print(f"  • Net Realized Trading PnL:                                     --> Net Realized PnL:  +Rs {net_pnl_rs:,.2f}")
     print(f"Profit Factor (Gross Gain / Loss): {profit_factor:.2f}x")
     print("-" * 115)
     print("EXIT MECHANISM & STOP-LOSS BREAKDOWN:")
-    print(f"  ðŸ›‘ Hard Stops (-10% Circuit Breaker):   {len(hard_sl):>4} trades | Total Loss: -Rs {abs(hard_sl['pnl_amount'].sum()):,.2f} | Avg Loss: {hard_sl['net_return_pct'].mean():.2f}%")
-    print(f"  âš ï¸  Closing Stops (-8% Threshold):       {len(closing_sl):>4} trades | Total Loss: -Rs {abs(closing_sl['pnl_amount'].sum()):,.2f} | Avg Loss: {closing_sl['net_return_pct'].mean():.2f}%")
-    print(f"  â³ Dead-Money Stops (30d Stagnant):     {len(dead_money_sl):>4} trades | Total Loss: -Rs {abs(dead_money_sl['pnl_amount'].sum()):,.2f} | Avg Ret:  {dead_money_sl['net_return_pct'].mean():.2f}%")
+    print(f"  🛑 Hard Stops (-10% Circuit Breaker):   {len(hard_sl):>4} trades | Total Loss: -Rs {abs(hard_sl['pnl_amount'].sum()):,.2f} | Avg Loss: {hard_sl['net_return_pct'].mean():.2f}%")
+    print(f"  ⚠️  Closing Stops (-8% Threshold):       {len(closing_sl):>4} trades | Total Loss: -Rs {abs(closing_sl['pnl_amount'].sum()):,.2f} | Avg Loss: {closing_sl['net_return_pct'].mean():.2f}%")
+    print(f"  ⏱️  Dead-Money Stops (30d Stagnant):     {len(dead_money_sl):>4} trades | Total Loss: -Rs {abs(dead_money_sl['pnl_amount'].sum()):,.2f} | Avg Ret:  {dead_money_sl['net_return_pct'].mean():.2f}%")
     print(f"  -------------------------------------------------------------")
-    print(f"  ðŸ”´ TOTAL STOP-LOSS HITS:               {total_sl_hits:>4} trades ({total_sl_hits/total_trades*100:.1f}% of all trades)")
+    print(f"  🔴 TOTAL STOP-LOSS HITS:               {total_sl_hits:>4} trades ({total_sl_hits/total_trades*100:.1f}% of all trades)")
     print(f"  -------------------------------------------------------------")
-    print(f"  ðŸ›¡ï¸  Stage 2 Breakeven (+2% Floor Locked):{len(stage2_be):>4} trades | Total PnL:  +Rs {stage2_be['pnl_amount'].sum():,.2f}")
-    print(f"  ðŸ“ˆ Stage 3 Ratchet (+12% Floor Locked): {len(stage3_ratchet):>4} trades | Total PnL:  +Rs {stage3_ratchet['pnl_amount'].sum():,.2f}")
-    print(f"  ðŸš€ Stage 4 Secular (+25% Floor Locked): {len(stage4_secular):>4} trades | Total PnL:  +Rs {stage4_secular['pnl_amount'].sum():,.2f}")
-    print(f"  ðŸ† Stage 5 Climax (Parabolic Blow-off): {len(stage5_climax):>4} trades | Total PnL:  +Rs {stage5_climax['pnl_amount'].sum():,.2f}")
+    print(f"  🛡️  Stage 2 Breakeven (+2% Floor Locked):{len(stage2_be):>4} trades | Total PnL:  +Rs {stage2_be['pnl_amount'].sum():,.2f}")
+    print(f"  📈 Stage 3 Ratchet (+12% Floor Locked): {len(stage3_ratchet):>4} trades | Total PnL:  +Rs {stage3_ratchet['pnl_amount'].sum():,.2f}")
+    print(f"  🚀 Stage 4 Secular (+25% Floor Locked): {len(stage4_secular):>4} trades | Total PnL:  +Rs {stage4_secular['pnl_amount'].sum():,.2f}")
+    print(f"  🏆 Stage 5 Climax (Parabolic Blow-off): {len(stage5_climax):>4} trades | Total PnL:  +Rs {stage5_climax['pnl_amount'].sum():,.2f}")
     print(f"  -------------------------------------------------------------")
-    print(f"  ðŸŸ¢ TOTAL PROFIT-FLOOR TRAIL EXITS:     {total_trailing_exits:>4} trades ({total_trailing_exits/total_trades*100:.1f}% of all trades)")
+    print(f"  🟢 TOTAL PROFIT-FLOOR TRAIL EXITS:     {total_trailing_exits:>4} trades ({total_trailing_exits/total_trades*100:.1f}% of all trades)")
 
     summary_metric_df = pd.DataFrame([{
         "Metric": "8-Slot Master Backtest (2000-2026)",
@@ -209,8 +209,8 @@ def main():
     losing_stocks = stk_df[stk_df["Net_PnL_Rs"] <= 0]
 
     print(f"Total Unique Stocks Traded:    {len(stk_df)}")
-    print(f"  â€¢ Net Profitable Stocks:     {len(profitable_stocks)} ({len(profitable_stocks)/len(stk_df)*100:.1f}%)")
-    print(f"  â€¢ Net Loss-Making Stocks:    {len(losing_stocks)} ({len(losing_stocks)/len(stk_df)*100:.1f}%)")
+    print(f"  • Net Profitable Stocks:     {len(profitable_stocks)} ({len(profitable_stocks)/len(stk_df)*100:.1f}%)")
+    print(f"  • Net Loss-Making Stocks:    {len(losing_stocks)} ({len(losing_stocks)/len(stk_df)*100:.1f}%)")
     print("\n--- TOP 10 HIGHEST PROFIT-GENERATING STOCKS ---")
     print(profitable_stocks.head(10)[["Symbol", "Sector", "Total_Trades", "Wins", "Win_Rate_%", "Net_PnL_Rs", "Best_Trade_%", "Worst_Trade_%"]].to_string(index=False))
 

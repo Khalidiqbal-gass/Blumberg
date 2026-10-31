@@ -468,7 +468,7 @@ class LivePortfolioManager:
                         exit_price = close_p
                         exit_reason = "Unresolved >35% Drop (3 sessions) - forced exit"
                     else:
-                        logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
+                        logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
                         actions_taken.append(f"⚠️ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Auto-exit halted for audit; forced exit after 3 sessions.")
                 elif low_p <= hard_stop:
                     exit_triggered = True
