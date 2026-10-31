@@ -147,12 +147,16 @@ def clean_transient_price_spikes(
     reversion_max: float = 1.4,
 ) -> tuple[pd.DataFrame, int]:
     """Detect and repair transient single-session data glitches (bad ticks/unadjusted spikes).
-    
+
     A transient glitch occurs when a single bar jumps >2x or falls <0.5x relative to prior close,
     but the subsequent bar reverts back within [reversion_min, reversion_max] of the prior close.
     Such glitches poison 52-week highs and corrupt ATR stops.
-    
-    Repairs by interpolating open/high/low/close from adjacent true market closes.
+
+    FIX (Lookahead): Detection uses shift(-1) only to CONFIRM reversion (not to alter future bars).
+    Repair interpolates using ONLY the prior close (c_prev) — no future data enters the repaired price.
+    The last bar of each symbol can never be glitch-tagged (c_next is NaN), which is correct behaviour
+    in live trading where the future close is unknown.
+
     Returns (cleaned_df, num_repaired_bars).
     """
     if df.empty or "close" not in df.columns or "symbol" not in df.columns:
@@ -160,6 +164,8 @@ def clean_transient_price_spikes(
 
     sorted_df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
     c_prev = sorted_df.groupby("symbol")["close"].shift(1)
+    # c_next is used ONLY as a confirmation signal (reversion check), NOT for imputing the repaired price.
+    # This means the last bar of any symbol is never cleaned (c_next == NaN → mask is False). Correct.
     c_next = sorted_df.groupby("symbol")["close"].shift(-1)
 
     ratio_high = sorted_df["high"] / c_prev
@@ -175,10 +181,12 @@ def clean_transient_price_spikes(
         return sorted_df, 0
 
     cleaned = sorted_df.copy()
-    interp_price = (c_prev.loc[mask_glitch] + c_next.loc[mask_glitch]) / 2.0
-    cleaned.loc[mask_glitch, "open"] = interp_price
-    cleaned.loc[mask_glitch, "high"] = interp_price * 1.005
-    cleaned.loc[mask_glitch, "low"] = interp_price * 0.995
-    cleaned.loc[mask_glitch, "close"] = interp_price
+    # FIX: Repair price uses ONLY c_prev (causal). Old code averaged (c_prev + c_next) / 2,
+    # which injected future price information into the repaired bar's OHLC values.
+    repair_price = c_prev.loc[mask_glitch]
+    cleaned.loc[mask_glitch, "open"] = repair_price
+    cleaned.loc[mask_glitch, "high"] = repair_price * 1.005
+    cleaned.loc[mask_glitch, "low"] = repair_price * 0.995
+    cleaned.loc[mask_glitch, "close"] = repair_price
 
     return cleaned, num_glitches

@@ -1,4 +1,4 @@
-"""Early Rally Scanner: Pre-rally range compression, volume footprint, and explainable scoring."""
+﻿"""Early Rally Scanner: Pre-rally range compression, volume footprint, and explainable scoring."""
 from __future__ import annotations
 
 import numpy as np
@@ -108,7 +108,7 @@ def compute_pre_rally_features(
 
         # 6. Daily Traded Value / Liquidity (Turnover in ₹ Crores)
         df["turnover_cr"] = (c * v) / 10_000_000.0
-        df["avg_turnover_20d_cr"] = df["turnover_cr"].rolling(20, min_periods=5).mean()
+        df["avg_turnover_20d_cr"] = df["turnover_cr"].shift(1).rolling(20, min_periods=5).mean()  # FIX: shift(1) prevents today leaking into baseline (lookahead)
 
         # 7. Volatility (ATR%)
         tr = np.maximum(

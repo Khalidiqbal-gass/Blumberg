@@ -1,4 +1,4 @@
-"""Upgraded VCP & Multi-Stage Secular Backtesting Engine.
+﻿"""Upgraded VCP & Multi-Stage Secular Backtesting Engine.
 
 Principal Quantitative Architecture incorporating:
 1. True Volatility Contraction Pattern (VCP Compression & ATR_10 < ATR_30 & Close >= 0.85 * 52W_High).
@@ -180,10 +180,13 @@ class UpgradedVCPBacktestEngine:
         df["adv_20"] = df["turnover"].shift(1).rolling(20, min_periods=10).mean()  # known before the open
 
         # 5. Relative Strength vs Benchmark (63 Days / 3 Months)
+        # FIX (bfill lookahead): Do NOT use bfill() on benchmark alignment — it backfills early
+        # stock bars with future benchmark data when the stock predates the benchmark series start.
+        # Compute bench_ret_63d on the benchmark itself, then map via date lookup (ffill only).
         stock_ret_63d = df["close"].pct_change(63)
-        bench_aligned = bench_series.reindex(df["date"]).ffill().bfill()
-        bench_ret_63d = bench_aligned.pct_change(63).values
-        df["rs_63d"] = stock_ret_63d - bench_ret_63d
+        bench_ret_63d_series = bench_series.pct_change(63)  # 63-day return on benchmark dates
+        bench_aligned_ret = bench_ret_63d_series.reindex(df["date"]).ffill()  # causal: no bfill
+        df["rs_63d"] = stock_ret_63d - bench_aligned_ret.values
         df["rs_score"] = np.maximum(0.01, df["rs_63d"].fillna(0.0)) * df["rvol"].fillna(1.0)
 
         # 6. True VCP Discovery Condition
@@ -730,8 +733,9 @@ class UpgradedVCPBacktestEngine:
                         and pd.notnull(bar["prev_close"])
                         and bar["close"] < bar["prev_close"]  # locked DOWN (an upper-circuit lock can always be sold into)
                     )
-                    if is_lower_circuit and exit_reason != "Dead Money Time-Stop Exit (30d Stagnation)":
-                        # Defer exit to next session — position stays open, no close recorded
+                    # FIX: All lower-circuit exits defer, including Dead Money (cannot sell on locked bar).
+                    if is_lower_circuit:
+                        # Defer exit to next session â€” position stays open, no close recorded
                         tr.exit_reason = f"CIRCUIT_DEFER: {exit_reason}"
                         exit_triggered = False
                     else:
@@ -772,7 +776,7 @@ class UpgradedVCPBacktestEngine:
                         if dist_from_ema100 > 0.60:
                             tr.is_climax_reached = True
                         elif tr.is_climax_reached and dist_from_ema100 < 0.35:
-                            # Stock has cooled from parabolic zone — reset so Stage 4 applies
+                            # Stock has cooled from parabolic zone â€” reset so Stage 4 applies
                             tr.is_climax_reached = False
                     tr.bars_held += 1
 

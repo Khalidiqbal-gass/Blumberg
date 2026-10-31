@@ -1,4 +1,4 @@
-"""
+﻿"""
 Live Autonomous Paper Portfolio Engine (HYBRID_50_50 Sweet Spot 8-Slot Champion Model).
 
 Manages an active portfolio ledger implementing:
@@ -110,7 +110,13 @@ class LivePortfolioManager:
         self.tranche2_days = tranche2_days
         self.cost_per_side = (slippage_bps + statutory_bps) / 10_000.0
         self.max_pct_of_adv = max_pct_of_adv
-        self.cash_yield_daily = (cash_yield_pct_p_a / 100.0) / 252.0
+        # FIX: compound daily yield matches engine formula: (1 + r_annual)^(1/252) - 1
+        # Old formula (r/252) gives ~6.72% effective annual yield when compounded daily instead of 6.50%.
+        self.cash_yield_daily = (
+            (1.0 + cash_yield_pct_p_a / 100.0) ** (1.0 / 252.0) - 1.0
+            if cash_yield_pct_p_a > 0.0
+            else 0.0
+        )
         self.state = self.load_state()
 
     def load_state(self) -> LivePortfolioState:
@@ -308,7 +314,7 @@ class LivePortfolioManager:
                     pos["tranche2_date"] = today_date
                     pos["tranche2_shares"] = t2_shares
                     pos["tranche2_price"] = raw_t2
-                    actions_taken.append(f"🟢 TRANCHE 2 FILLED: {sym} +{t2_shares:.1f} shs @ open ₹{raw_t2:.2f} (Confirmed Winner)")
+                    actions_taken.append(f"ðŸŸ¢ TRANCHE 2 FILLED: {sym} +{t2_shares:.1f} shs @ open â‚¹{raw_t2:.2f} (Confirmed Winner)")
 
             # 0b. Tranche 1 entries queued yesterday
             queued = list(self.state.pending_entries)
@@ -334,7 +340,7 @@ class LivePortfolioManager:
                             self.state.pending_entries.append(q)
                         continue
                     if float(b["high"]) == float(b["low"]):  # upper-circuit lock: cannot buy
-                        actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at circuit, no entry")
+                        actions_taken.append(f"â›” ORDER REJECTED: {qsym} locked at circuit, no entry")
                         continue
                     raw_entry = float(b["open"])
                     t1_alloc = min(self.state.cash, slot_cap * 0.5, _liq_cap(b))
@@ -355,7 +361,7 @@ class LivePortfolioManager:
                     self.state.active_positions[qsym] = asdict(pos_obj)
                     fills_today.add(qsym)
                     free_slots -= 1
-                    actions_taken.append(f"🚀 ENTRY FILLED (Tranche 1): {qsym} {t1_shares:.1f} shs @ open ₹{raw_entry:.2f} (Invested: ₹{t1_alloc:,.0f})")
+                    actions_taken.append(f"ðŸš€ ENTRY FILLED (Tranche 1): {qsym} {t1_shares:.1f} shs @ open â‚¹{raw_entry:.2f} (Invested: â‚¹{t1_alloc:,.0f})")
 
         # Step A: Evaluate Exits for Active Trades (positions opened this morning are not evaluated today, as in the engine)
         symbols_to_close = []
@@ -400,7 +406,7 @@ class LivePortfolioManager:
                 if dip_from_peak <= -25.0:
                     exit_triggered = True
                     exit_price = min(prior_peak * 0.75, open_p)
-                    exit_reason = f"Parabolic Climax Exit (-25% Trail from Peak ₹{prior_peak:.2f})"
+                    exit_reason = f"Parabolic Climax Exit (-25% Trail from Peak â‚¹{prior_peak:.2f})"
 
             # ---------------- STAGE 4: SECULAR COMPOUNDER (peak >= +50%) ----------------
             elif gain_from_entry >= 50.0:
@@ -462,8 +468,8 @@ class LivePortfolioManager:
                         exit_price = close_p
                         exit_reason = "Unresolved >35% Drop (3 sessions) - forced exit"
                     else:
-                        logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
-                        actions_taken.append(f"⚠️ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Auto-exit halted for audit; forced exit after 3 sessions.")
+                        logger.warning(f"âš ï¸ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
+                        actions_taken.append(f"âš ï¸ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Auto-exit halted for audit; forced exit after 3 sessions.")
                 elif low_p <= hard_stop:
                     exit_triggered = True
                     exit_price = min(hard_stop, open_p)
@@ -493,7 +499,7 @@ class LivePortfolioManager:
                     pos["current_stage"] = f"CIRCUIT_DEFER: {exit_reason}"
                     if not is_same_day_rerun:
                         pos["bars_held"] = pos.get("bars_held", 0) + 1
-                    actions_taken.append(f"⚠️ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
+                    actions_taken.append(f"âš ï¸ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
                     if high_p > prior_peak:
                         pos["peak_price"] = high_p
                         pos["peak_gain_pct"] = (high_p / entry_p - 1.0) * 100.0
@@ -541,7 +547,7 @@ class LivePortfolioManager:
             )
             self.state.closed_trades.append(asdict(closed_rec))
             del self.state.active_positions[sym]
-            actions_taken.append(f"🔴 SELL: {sym} exited at ₹{exit_p:.2f} ({net_ret:+.1f}%) | Reason: {reason}")
+            actions_taken.append(f"ðŸ”´ SELL: {sym} exited at â‚¹{exit_p:.2f} ({net_ret:+.1f}%) | Reason: {reason}")
 
         # Step C: Queue new signals. They are FILLED at tomorrow's open (never at the signal-day close,
         # which is unattainable and not what the backtest assumes).
@@ -562,7 +568,7 @@ class LivePortfolioManager:
                 })
                 queued_syms.add(sym)
                 available_slots -= 1
-                actions_taken.append(f"📝 BUY ORDER QUEUED: {sym} (fills at next session open)")
+                actions_taken.append(f"ðŸ“ BUY ORDER QUEUED: {sym} (fills at next session open)")
 
         # Step D: Final Mark to Market & Save
         final_summary = self.get_summary(bars_latest["close"].to_dict())

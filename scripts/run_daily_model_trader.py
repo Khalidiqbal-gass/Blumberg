@@ -1,4 +1,4 @@
-"""
+﻿"""
 Daily Autonomous Model Execution Script (HYBRID_50_50 Champion Model).
 
 Runs the complete daily execution cycle for the Live Paper Portfolio:
@@ -44,7 +44,7 @@ def run_daily_autonomous_trader(
     sync_live: bool = False,
 ) -> None:
     print("=" * 100)
-    print("   BLUMBERG AUTONOMOUS MODEL TRADER — HYBRID_50_50 CHAMPION REBALANCE")
+    print("   BLUMBERG AUTONOMOUS MODEL TRADER â€” HYBRID_50_50 CHAMPION REBALANCE")
     print("=" * 100)
 
     # 0. Sync fresh live EOD data if requested
