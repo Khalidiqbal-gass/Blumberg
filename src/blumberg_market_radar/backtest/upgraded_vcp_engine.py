@@ -1,4 +1,4 @@
-﻿"""Upgraded VCP & Multi-Stage Secular Backtesting Engine.
+"""Upgraded VCP & Multi-Stage Secular Backtesting Engine.
 
 Principal Quantitative Architecture incorporating:
 1. True Volatility Contraction Pattern (VCP Compression & ATR_10 < ATR_30 & Close >= 0.85 * 52W_High).

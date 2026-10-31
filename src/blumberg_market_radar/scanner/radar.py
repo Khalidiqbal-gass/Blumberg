@@ -1,4 +1,4 @@
-﻿"""Early Rally Scanner: Pre-rally range compression, volume footprint, and explainable scoring."""
+"""Early Rally Scanner: Pre-rally range compression, volume footprint, and explainable scoring."""
 from __future__ import annotations
 
 import numpy as np

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Master 8-Slot Quantitative Audit Suite (2000 - 2026).
 
 Computes:

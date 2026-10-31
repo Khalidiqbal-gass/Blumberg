@@ -1,4 +1,4 @@
-﻿"""
+"""
 Daily Autonomous Model Execution Script (HYBRID_50_50 Champion Model).
 
 Runs the complete daily execution cycle for the Live Paper Portfolio:
