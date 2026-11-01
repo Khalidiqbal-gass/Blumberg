@@ -28,6 +28,7 @@ if sys.platform == "win32":
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT))  # lets `--sync-live` import scripts.sync_today_pipeline_bars
 
 from blumberg_market_radar.data.ingestion import fetch_historical_ohlcv, fetch_benchmark
 from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
@@ -45,7 +46,11 @@ HISTORICAL_DIR = DATA_DIR / "cache" / "historical_2000_2026"
 CACHE_MARKET = DATA_DIR / "cache" / "market_eod_all_equities.parquet"
 
 
-def scan_engine_vcp_candidates(bars_df: pd.DataFrame, bench_df: pd.DataFrame) -> pd.DataFrame:
+def scan_engine_vcp_candidates(
+    bars_df: pd.DataFrame,
+    bench_df: pd.DataFrame,
+    min_price: float = 0.0,
+) -> pd.DataFrame:
     """Scan candidate breakout setups using the EXACT quantitative logic of UpgradedVCPBacktestEngine.
     
     Parity details:
@@ -55,7 +60,12 @@ def scan_engine_vcp_candidates(bars_df: pd.DataFrame, bench_df: pd.DataFrame) ->
     - Same volume ignition (ret_5d > 0 and rvol >= 1.4)
     - Same dynamic turnover floor (turnover >= dyn_floor)
     - Same cross-sectional ranking: rs_score = max(0.01, rs_63d) * rvol
+
+    min_price defaults to 0 because the backtest has NO price floor (29% of its trades were
+    below Rs 50). Set it > 0 only knowingly: it makes live diverge from the backtest.
+    Symbols whose last bar is not the latest session in `bars_df` are skipped (stale signal).
     """
+    latest_session = pd.Timestamp(bars_df["date"].max())
     bench_sorted = bench_df.sort_values("date").copy()
     bench_series = bench_sorted.set_index("date")["close"]
     candidates = []
@@ -66,10 +76,12 @@ def scan_engine_vcp_candidates(bars_df: pd.DataFrame, bench_df: pd.DataFrame) ->
         if ind_df.empty:
             continue
         last_row = ind_df.iloc[-1]
+        if pd.Timestamp(last_row["date"]) != latest_session:
+            continue  # no bar on the latest session: signal is stale
         if bool(last_row.get("raw_signal", False)):
             close_p = float(last_row["close"])
-            if close_p < 50.0:
-                continue  # penny stock filter
+            if close_p < min_price:
+                continue
             rs_score = float(last_row["rs_score"]) if pd.notna(last_row.get("rs_score")) else 0.01
             rvol = float(last_row["rvol"]) if pd.notna(last_row.get("rvol")) else 1.0
             atr_14 = float(last_row["atr_14"]) if pd.notna(last_row.get("atr_14")) else 0.0
@@ -97,6 +109,8 @@ def run_daily_autonomous_trader(
     sync_live: bool = False,
     signal_source: str = "ENGINE_VCP",  # "ENGINE_VCP" (100% backtest parity) or "RADAR_COMPOSITE"
     reset_state: bool = False,
+    min_price: float = 0.0,
+    max_stale_days: int = 4,
 ) -> None:
     print("=" * 100)
     print("   BLUMBERG AUTONOMOUS MODEL TRADER — HYBRID_50_50 CHAMPION REBALANCE")
@@ -110,7 +124,8 @@ def run_daily_autonomous_trader(
             from scripts.sync_today_pipeline_bars import sync_today
             sync_today()
         except Exception as exc:
-            print(f"[WARNING] Live sync encountered: {exc}. Proceeding with latest cached data.")
+            print(f"[ERROR] Live sync failed: {exc}. Aborting rather than trading on stale data.")
+            return
 
     # 1. Load Market Data
     if (HISTORICAL_DIR / "market_bars_with_delisted_2000_2026.parquet").exists():
@@ -127,6 +142,11 @@ def run_daily_autonomous_trader(
 
     # Use recent bars for feature scanning
     max_dt = bars_df["date"].max()
+    age_days = (pd.Timestamp.now(tz=max_dt.tz).normalize() - pd.Timestamp(max_dt).normalize()).days
+    if age_days > max_stale_days:
+        print(f"[ERROR] Latest market bar is {max_dt:%Y-%m-%d} ({age_days} days old, limit {max_stale_days}). "
+              "Refresh data (--sync-live) or raise --max-stale-days. Aborting.")
+        return
     recent_bars = bars_df[bars_df["date"] >= (max_dt - pd.Timedelta(days=730))].copy()
     recent_bars = validate_ohlcv(recent_bars, clean_glitches=True)
     recent_bench = bench_df[bench_df["date"] >= (max_dt - pd.Timedelta(days=730))].copy()
@@ -136,12 +156,12 @@ def run_daily_autonomous_trader(
     # 2. Compute Candidate Setups based on selected signal_source
     if signal_source.upper() == "ENGINE_VCP":
         print("Scanning candidates via UpgradedVCPBacktestEngine (100% Backtest Parity Mode)...")
-        ranked_clean = scan_engine_vcp_candidates(recent_bars, recent_bench)
+        ranked_clean = scan_engine_vcp_candidates(recent_bars, recent_bench, min_price=min_price)
     else:
         print("Scanning candidates via Pre-Rally Radar 4-factor composite score...")
         feats = compute_pre_rally_features(recent_bars, recent_bench)
         ranked = score_pre_rally_candidates(feats, None, min_turnover_cr=1.5)
-        ranked_clean = ranked[ranked["close"] >= 50.0].copy() if not ranked.empty else pd.DataFrame()
+        ranked_clean = ranked[ranked["close"] >= min_price].copy() if not ranked.empty else pd.DataFrame()
 
     print(f"Identified {len(ranked_clean)} candidate setups meeting breakout and liquidity criteria.\n")
 
@@ -231,6 +251,10 @@ if __name__ == "__main__":
     parser.add_argument("--signal-source", choices=["ENGINE_VCP", "RADAR_COMPOSITE"], default="ENGINE_VCP",
                         help="ENGINE_VCP (100 percent Backtest Parity) or RADAR_COMPOSITE (Legacy 4-factor)")
     parser.add_argument("--reset-state", action="store_true", help="Reset live portfolio to clean cash before run")
+    parser.add_argument("--min-price", type=float, default=0.0,
+                        help="Minimum close price filter (default 0 = backtest parity; backtest has no price floor)")
+    parser.add_argument("--max-stale-days", type=int, default=4,
+                        help="Abort if the latest market bar is older than this many calendar days")
     args = parser.parse_args()
 
     run_daily_autonomous_trader(
@@ -239,4 +263,6 @@ if __name__ == "__main__":
         sync_live=args.sync_live,
         signal_source=args.signal_source,
         reset_state=args.reset_state,
+        min_price=args.min_price,
+        max_stale_days=args.max_stale_days,
     )

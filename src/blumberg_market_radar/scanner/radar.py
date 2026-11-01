@@ -383,6 +383,13 @@ def score_pre_rally_candidates(
     return out_df.sort_values("radar_score", ascending=False).reset_index(drop=True)
 
 
+_UNCLASSIFIED_SECTORS = {"", "NAN", "NONE", "UNKNOWN", "DIVERSIFIED", "DIVERSIFIED / GENERAL"}
+
+
+def _is_unclassified_sector(sec: str) -> bool:
+    return sec.strip().upper() in _UNCLASSIFIED_SECTORS
+
+
 def apply_sector_cluster_guardrail(
     ranked_candidates: pd.DataFrame,
     active_pipeline_df: pd.DataFrame | None = None,
@@ -395,6 +402,10 @@ def apply_sector_cluster_guardrail(
     - Captures the entire cluster of winners (e.g. HAL, BEL, Mazdock, Cochin, GRSE) without missing super-runners.
     - Caps sector risk so that a sector crash cannot hit the portfolio by more than -2.0% max.
     - Prioritizes candidates by highest Composite Pre-Rally Radar Score.
+
+    Unclassified sectors ("Diversified", "Unknown", blank) carry no sector information, so the
+    per-sector cap is NOT applied to them (otherwise a data feed without sector tags would collapse
+    the whole portfolio to `max_stocks_per_sector` positions). The slot limit still applies.
 
     Returns:
         (approved_candidates_df, sector_counts_dict, available_slots)
@@ -433,8 +444,8 @@ def apply_sector_cluster_guardrail(
         sec = str(row.get("sector") or "Diversified / General").strip()
         current_count = sector_counts.get(sec, 0)
 
-        # Enforce maximum 5 stocks per sector (25% exposure)
-        if current_count < max_stocks_per_sector:
+        # Enforce maximum 5 stocks per sector (25% exposure); unclassified sectors are exempt
+        if _is_unclassified_sector(sec) or current_count < max_stocks_per_sector:
             approved_records.append(dict(row))
             sector_counts[sec] = current_count + 1
             active_symbols.add(sym)

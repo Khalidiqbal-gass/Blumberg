@@ -114,3 +114,35 @@ def test_live_fill_is_capped_by_adv(temp_portfolio):
     mgr.execute_daily_rebalance(bars2, BENCH, pd.DataFrame(), current_date_str=nxt)
     pos = mgr.state.active_positions["DIXON"]
     assert pos["invested_capital"] <= 1_000_000.0 + 1.0   # 10% of Rs 1 Cr ADV, not Rs 6.25 Cr (half of a 12.5 Cr slot)
+
+
+def test_stale_signal_is_not_queued(temp_portfolio):
+    """A candidate whose symbol has no bar today must not be queued."""
+    bars = pd.concat([
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0, sym="DIXON"),
+        _bar("2026-10-23", 500.0, 510.0, 490.0, 500.0, sym="STALE"),
+    ])
+    cand = pd.DataFrame([{"symbol": "STALE", "close": 500.0, "sector": "X"}])
+    temp_portfolio.execute_daily_rebalance(bars, BENCH, cand, current_date_str="2026-10-26")
+    assert temp_portfolio.state.pending_entries == []
+
+
+def test_dropped_queued_orders_are_logged(temp_portfolio):
+    temp_portfolio.state.pending_entries = [
+        {"symbol": "DIXON", "signal_date": "2026-10-26", "sector": "X", "selection_reason": "t"}
+    ]
+    temp_portfolio.state.cash = 100.0  # no cash -> order cannot fill
+    res = temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-27", 1020.0, 1030.0, 1015.0, 1025.0), BENCH, pd.DataFrame(), current_date_str="2026-10-27"
+    )
+    assert any("QUEUED ORDERS DROPPED" in a and "DIXON" in a for a in res["actions_taken"])
+
+
+def test_sector_guardrail_does_not_cap_unclassified_sectors():
+    from blumberg_market_radar.scanner.radar import apply_sector_cluster_guardrail
+    cands = pd.DataFrame([{"symbol": f"S{i}", "sector": "Diversified"} for i in range(8)])
+    approved, _, free = apply_sector_cluster_guardrail(cands, None, max_stocks_per_sector=2, max_portfolio_slots=8)
+    assert free == 8 and len(approved) == 8
+    classified = pd.DataFrame([{"symbol": f"S{i}", "sector": "Banks"} for i in range(8)])
+    approved, _, _ = apply_sector_cluster_guardrail(classified, None, max_stocks_per_sector=2, max_portfolio_slots=8)
+    assert len(approved) == 2  # real sector cap still enforced

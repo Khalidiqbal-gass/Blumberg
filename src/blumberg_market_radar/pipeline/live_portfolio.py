@@ -11,7 +11,7 @@ Manages an active portfolio ledger implementing:
    - Stage 1: Hard Stop (-10%) / ATR Stop (-8%) / 30d Dead-Money Stop
    - Stage 2: Breakeven Floor (+2% Profit Locked) at +15% Peak
    - Stage 3: Ratchet Floor (+12% Profit Locked & 50 EMA) at +30% Peak
-   - Stage 4: Secular Multibagger Floor (+25% Profit Locked & 100 EMA) at +60% Peak
+   - Stage 4: Secular Multibagger Floor (+25% Profit Locked & 100 EMA) at +50% Peak
    - Stage 5: Climax Harvesting (25% Trailing Drawdown from Peak) at +100%+ Peak
 5. Persistent JSON Ledger storage (data/live_portfolio_state.json).
 """
@@ -329,6 +329,10 @@ class LivePortfolioManager:
                 for q in queued:
                     qsym = q["symbol"]
                     if free_slots <= 0 or self.state.cash < 2500.0:
+                        dropped = [x["symbol"] for x in queued[queued.index(q):] if x["symbol"] not in self.state.active_positions]
+                        actions_taken.append(
+                            f"⚠️ QUEUED ORDERS DROPPED (no free slot/cash): {', '.join(dropped)}"
+                        )
                         break
                     if qsym in self.state.active_positions:
                         continue
@@ -558,8 +562,8 @@ class LivePortfolioManager:
                 if available_slots <= 0:
                     break
                 sym = str(row["symbol"]).upper().replace(".NS", "").replace(".BO", "").strip()
-                if sym in self.state.active_positions or sym in queued_syms or sym not in bars_latest.index:
-                    continue
+                if sym in self.state.active_positions or sym in queued_syms or _bar_today(sym) is None:
+                    continue  # no bar today -> stale signal, never queue
                 self.state.pending_entries.append({
                     "symbol": sym,
                     "signal_date": today_date,
