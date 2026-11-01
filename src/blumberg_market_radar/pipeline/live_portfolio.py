@@ -111,7 +111,9 @@ class LivePortfolioManager:
         self.tranche2_days = tranche2_days
         self.cost_per_side = (slippage_bps + statutory_bps) / 10_000.0
         self.max_pct_of_adv = max_pct_of_adv
-        self.regime_mode = regime_mode.upper()
+        self.regime_mode = str(regime_mode).upper()
+        if self.regime_mode not in ("OR", "AND", "AND_TREND"):
+            raise ValueError(f"Invalid regime_mode {regime_mode!r}; expected OR, AND or AND_TREND")
         # FIX: compound daily yield matches engine formula: (1 + r_annual)^(1/252) - 1
         # Old formula (r/252) gives ~6.72% effective annual yield when compounded daily instead of 6.50%.
         self.cash_yield_daily = (

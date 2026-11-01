@@ -39,3 +39,27 @@ def test_live_portfolio_regime_logic(tmp_path):
     
     assert mgr_or.regime_mode == "OR"
     assert mgr_and.regime_mode == "AND"
+
+
+def test_invalid_regime_mode_raises(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        UpgradedVCPBacktestEngine(regime_mode="AN")
+    with pytest.raises(ValueError):
+        LivePortfolioManager(state_path=tmp_path / "s.json", regime_mode="strict")
+
+
+def test_live_manager_blocks_entries_in_AND_but_not_OR_regime(tmp_path):
+    # close above EMA200 but below EMA50 -> OR allows, AND blocks
+    dates = pd.bdate_range("2026-01-01", periods=250)
+    close = np.linspace(100, 200, 250)
+    close[-1] = 175.0
+    bench = pd.DataFrame({"date": dates, "close": close})
+    day = dates[-1].strftime("%Y-%m-%d")
+    bars = pd.DataFrame([{"date": dates[-1], "symbol": "DIXON", "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 100000}])
+    cand = pd.DataFrame([{"symbol": "DIXON", "sector": "X"}])
+    res = {}
+    for mode in ("OR", "AND"):
+        mgr = LivePortfolioManager(state_path=tmp_path / f"{mode}.json", regime_mode=mode)
+        res[mode] = mgr.execute_daily_rebalance(bars, bench, cand, current_date_str=day)["regime_ok"]
+    assert res == {"OR": True, "AND": False}

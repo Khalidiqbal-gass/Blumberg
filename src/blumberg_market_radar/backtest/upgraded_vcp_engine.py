@@ -139,7 +139,9 @@ class UpgradedVCPBacktestEngine:
         self.stale_exit_sessions = stale_exit_sessions
         self.clean_glitches = clean_glitches
         self.max_pct_of_adv = max_pct_of_adv
-        self.regime_mode = regime_mode.upper()
+        self.regime_mode = str(regime_mode).upper()
+        if self.regime_mode not in ("OR", "AND", "AND_TREND"):
+            raise ValueError(f"Invalid regime_mode {regime_mode!r}; expected OR, AND or AND_TREND")
         self.dd_brake_pct = dd_brake_pct
         self.dd_resume_pct = dd_resume_pct if dd_resume_pct is not None else (dd_brake_pct / 2.0 if dd_brake_pct else None)
 
