@@ -374,6 +374,9 @@ class LivePortfolioManager:
                 continue
             if sym not in bars_latest.index:
                 continue
+            # Only evaluate exits on today's session bar; a stale bar must never trigger a sale
+            if _bar_today(sym) is None:
+                continue
 
             bar = bars_latest.loc[sym]
             close_p = float(bar["close"])
