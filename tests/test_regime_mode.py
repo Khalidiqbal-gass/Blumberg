@@ -39,3 +39,14 @@ def test_live_portfolio_regime_logic(tmp_path):
     
     assert mgr_or.regime_mode == "OR"
     assert mgr_and.regime_mode == "AND"
+
+
+def test_regime_blocks_entries_with_insufficient_history(tmp_path):
+    # Only 100 bench bars: EMA200 undefined -> entries must be blocked, not judged on EMA50
+    dates = pd.bdate_range("2026-01-01", periods=100)
+    bench = pd.DataFrame({"date": dates, "close": np.linspace(100, 200, 100)})
+    bars = pd.DataFrame([{"date": dates[-1], "symbol": "DIXON", "open": 100.0, "high": 101.0, "low": 99.0, "close": 200.0, "volume": 100000}])
+    cand = pd.DataFrame([{"symbol": "DIXON", "sector": "X"}])
+    mgr = LivePortfolioManager(state_path=tmp_path / "s.json", regime_mode="OR")
+    res = mgr.execute_daily_rebalance(bars, bench, cand, current_date_str=dates[-1].strftime("%Y-%m-%d"))
+    assert res["regime_ok"] is False
