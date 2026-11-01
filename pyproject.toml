@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "ruff>=0.6", "scikit-learn>=1.5", "pyarrow>=14.0"]
 dashboard = ["streamlit>=1.38", "plotly>=5.20.0", "matplotlib>=3.8"]
 ml = ["scikit-learn>=1.5", "lightgbm>=4.4", "xgboost>=2.1"]
 news = ["beautifulsoup4>=4.12", "pypdf>=5.0"]

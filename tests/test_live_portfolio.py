@@ -114,3 +114,28 @@ def test_live_fill_is_capped_by_adv(temp_portfolio):
     mgr.execute_daily_rebalance(bars2, BENCH, pd.DataFrame(), current_date_str=nxt)
     pos = mgr.state.active_positions["DIXON"]
     assert pos["invested_capital"] <= 1_000_000.0 + 1.0   # 10% of Rs 1 Cr ADV, not Rs 6.25 Cr (half of a 12.5 Cr slot)
+
+
+def test_stale_bar_does_not_trigger_exit(temp_portfolio):
+    """A held stock with no bar for today must not be exited on an older bar's stop-loss."""
+    dates = pd.bdate_range("2026-01-01", periods=40)
+    rows = []
+    for dt in dates:
+        rows.append(dict(symbol="AAA", date=dt, open=100.0, high=101.0, low=99.0, close=100.0, volume=1e6))
+        if dt != dates[-1]:
+            rows.append(dict(symbol="BBB", date=dt, open=50.0, high=50.5, low=49.5, close=50.0, volume=1e6))
+    bars = pd.DataFrame(rows)
+    bars.loc[(bars.symbol == "BBB") & (bars.date == dates[-2]), ["open", "low", "close"]] = [45.0, 40.0, 41.0]
+    bench = pd.DataFrame({"date": dates, "close": [100.0 + i for i in range(40)]})
+    temp_portfolio.state.active_positions["BBB"] = dict(
+        symbol="BBB", entry_date="2026-01-01", shares=1000.0, invested_capital=50000.0,
+        entry_price=50.0, entry_price_with_friction=50.0, current_price=50.0, peak_price=50.0,
+        current_gain_pct=0.0, peak_gain_pct=0.0, unrealized_pnl_rs=0.0, target_slot_capital=125000.0,
+        tranche1_shares=1000.0, tranche1_price=50.0, bars_held=29, sector="X",
+    )
+    temp_portfolio.state.cash = 950000.0
+    res = temp_portfolio.execute_daily_rebalance(
+        bars, bench, pd.DataFrame(), current_date_str=dates[-1].strftime("%Y-%m-%d"), enforce_regime=False
+    )
+    assert "BBB" in temp_portfolio.state.active_positions
+    assert not any("SELL: BBB" in a for a in res["actions_taken"])
