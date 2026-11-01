@@ -100,3 +100,38 @@ def test_clean_transient_price_spikes_flat_tick_repair():
     assert n_repaired == 1
     assert cleaned.loc[2, "close"] == 1000.0
     assert cleaned.loc[2, "open"] == 1000.0
+
+
+def test_validate_ohlcv_preserves_extra_columns():
+    """Verify validate_ohlcv does not drop auxiliary columns like is_corporate_anomaly or sector."""
+    df = sample_bars()
+    df["is_corporate_anomaly"] = [False, True]
+    df["custom_meta"] = ["val1", "val2"]
+
+    validated = validate_ohlcv(df)
+    assert "is_corporate_anomaly" in validated.columns
+    assert "custom_meta" in validated.columns
+    assert validated["is_corporate_anomaly"].tolist() == [True, False]  # sorted order
+
+
+def test_cleaner_does_not_rewrite_real_split_with_volume():
+    """A genuine 2:1 stock split or flat candle with real volume must NOT be rewritten to prior close."""
+    from blumberg_market_radar.data.validation import clean_transient_price_spikes
+
+    dates = pd.bdate_range("2026-01-01", periods=5, tz="UTC")
+    df = pd.DataFrame({
+        "date": dates,
+        "symbol": "TCS",
+        "open": [1000.0] * 5,
+        "high": [1010.0] * 5,
+        "low": [990.0] * 5,
+        "close": [1000.0] * 5,
+        "volume": [500_000.0] * 5,
+    })
+    # 2:1 split with 500k shares traded: flat open at 500.0, close at 500.0
+    df.loc[2, ["open", "high", "low", "close", "volume"]] = [500.0, 500.0, 500.0, 500.0, 500_000.0]
+
+    cleaned, n_repaired = clean_transient_price_spikes(df)
+    # Must NOT be repaired; this is a genuine corporate action with volume, not a data glitch
+    assert n_repaired == 0
+    assert cleaned.loc[2, "close"] == 500.0

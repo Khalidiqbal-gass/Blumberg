@@ -124,7 +124,7 @@ class UpgradedVCPBacktestEngine:
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg daily turnover (None = unlimited, legacy optimism)
         clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does
         regime_mode: str = "AND",  # Default strict "AND" (Close > 50 AND > 200 EMA); "OR" and "AND_TREND" optional
-        assumed_gtt_stops: bool = True,  # True = intraday stops filled via active broker GTT; False = EOD queue to next open
+        assumed_gtt_stops: bool = False,  # False = realistic: stops evaluated at EOD queue to next open (no broker GTT assumed)
         exit_execution_mode: str = "NEXT_OPEN",  # "NEXT_OPEN" (realistic: EOD signals fill at next session open), "SAME_BAR_CLOSE" (legacy)
     ) -> None:
         self.initial_capital = initial_capital
@@ -700,10 +700,9 @@ class UpgradedVCPBacktestEngine:
                 if "is_corporate_anomaly" in bar and bool(bar["is_corporate_anomaly"]):
                     is_corp_anomaly = True
                 elif prev_c is not None and prev_c > 0 and (bar["low"] / prev_c - 1.0) <= -0.35:
-                    vol_v = bar.get("volume", 0.0)
-                    adv_v = bar.get("adv_20", 0.0)
-                    vol_ratio = (vol_v / adv_v) if (pd.notnull(adv_v) and adv_v > 0) else 1.0
-                    if vol_ratio < 3.0:
+                    rvol_v = bar.get("rvol", 1.0)
+                    # Use dimensionless relative volume rvol (share volume / 20d avg share volume), NOT shares / rupee turnover!
+                    if pd.notnull(rvol_v) and rvol_v < 3.0:
                         is_corp_anomaly = True
                 elif bar["low"] <= tr.entry_price * 0.65 and prior_peak >= tr.entry_price * 0.95:
                     is_corp_anomaly = True
@@ -711,14 +710,12 @@ class UpgradedVCPBacktestEngine:
                 if is_corp_anomaly:
                     tr.anomaly_days = getattr(tr, "anomaly_days", 0) + 1
                     tr.is_quarantined = True
-                    if tr.anomaly_days >= 3:
-                        exit_triggered = True
-                        exit_price = bar["close"]
-                        exit_reason = "QUARANTINE_TIMEOUT: Unadjusted Demerger/Split (3 sessions)"
-                        stage_name = "Corporate Action Quarantine"
-                    else:
-                        tr.exit_reason = f"QUARANTINED_CORP_ACTION (day {tr.anomaly_days}/3)"
-                        continue
+                    # Demergers/splits without official adjustments must NOT book fabricated panic losses!
+                    # Quarantine trade and exit at pre-anomaly baseline clean price with explicit audit tag.
+                    exit_triggered = True
+                    exit_price = prev_c if (prev_c is not None and prev_c > 0) else bar["close"]
+                    exit_reason = "QUARANTINE_UNADJUSTED_CORPORATE_ACTION: Demerger/Split"
+                    stage_name = "Corporate Action Quarantine" 
 
                 # Check Tranche 2 eligibility for tomorrow in HYBRID_50_50
                 if exec_mode == "HYBRID_50_50" and not tr.tranche2_active and tr.bars_held >= (self.tranche2_days - 1):
@@ -832,16 +829,22 @@ class UpgradedVCPBacktestEngine:
                     )
                     # FIX: All lower-circuit exits defer, including Dead Money (cannot sell on locked bar).
                     if is_lower_circuit:
-                        # Defer exit to next session â€” position stays open, no close recorded
+                        # Lower circuit lock: queue exit to pending_exits so signal is NOT lost on rebound
                         tr.exit_reason = f"CIRCUIT_DEFER: {exit_reason}"
+                        pending_exits[sym] = (f"LOWER_CIRCUIT_DEFERRED: {exit_reason}", stage_name)
+                        tr.pending_exit = True
                         exit_triggered = False
+                        continue
                     else:
                         is_close_based = (
                             "Closing" in exit_reason
                             or "Dead Money" in exit_reason
                             or "100 EMA Break" in exit_reason
                             or "50 EMA Locked" in exit_reason
-                            or "QUARANTINE_TIMEOUT" in exit_reason
+                            or "Parabolic Climax" in exit_reason
+                            or "Secular Trend Ended" in exit_reason
+                            or "QUARANTINE" in exit_reason
+                            or "LOWER_CIRCUIT" in exit_reason
                         )
                         if self.exit_execution_mode == "NEXT_OPEN" and (is_close_based or not self.assumed_gtt_stops):
                             pending_exits[sym] = (exit_reason, stage_name)

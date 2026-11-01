@@ -104,7 +104,7 @@ class LivePortfolioManager:
         cash_yield_pct_p_a: float = 6.5,
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg turnover (same as backtest)
         regime_mode: str = "AND",  # Default strict "AND" (Close > 50 AND > 200 EMA); "OR" and "AND_TREND" optional
-        assumed_gtt_stops: bool = True,  # True = intraday stops filled via active broker GTT; False = EOD queue to next open
+        assumed_gtt_stops: bool = False,  # False = stops detected at EOD queue to next open (realistic, no broker GTT assumed)
     ):
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -551,16 +551,19 @@ class LivePortfolioManager:
                 )
 
                 if is_corp_action_anomaly:
+                    pos["is_quarantined"] = True
+                    stage_name = "Corporate Action Quarantine"
+                    pos["current_stage"] = "QUARANTINE_MANUAL_REVIEW"
                     if not is_same_day_rerun:
                         pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
-                    if int(pos.get("anomaly_days", 0)) >= 3:
-                        # A genuine crash must not be held forever just because it looks like an unadjusted corporate action
-                        exit_triggered = True
-                        exit_price = close_p
-                        exit_reason = "Unresolved >35% Drop (3 sessions) - forced exit"
-                    else:
-                        logger.warning(f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. Halting automated exit.")
-                        actions_taken.append(f"⚠️ HOLD / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). Auto-exit halted for audit; forced exit after 3 sessions.")
+                    logger.warning(
+                        f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. "
+                        "Quarantining position; automated liquidation halted."
+                    )
+                    actions_taken.append(
+                        f"⚠️ QUARANTINE / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). "
+                        "Automated market sell halted; requires manual corporate action adjustment."
+                    )
                 elif low_p <= hard_stop:
                     exit_triggered = True
                     exit_price = min(hard_stop, open_p)
@@ -587,10 +590,24 @@ class LivePortfolioManager:
                     prev_c = float(prev_recorded_price)  # price recorded at the previous rebalance
                 is_lower_circuit = (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)  # locked DOWN
                 if is_lower_circuit and "Dead Money" not in exit_reason:
-                    pos["current_stage"] = f"CIRCUIT_DEFER: {exit_reason}"
+                    already_pending = any(pe["symbol"] == sym for pe in self.state.pending_exits)
+                    if not already_pending and not is_same_day_rerun:
+                        self.state.pending_exits.append({
+                            "symbol": sym,
+                            "signal_date": today_date,
+                            "exit_reason": f"LOWER_CIRCUIT_DEFERRED: {exit_reason}",
+                            "stage_at_signal": stage_name,
+                            "signal_price": close_p,
+                            "shares": pos["shares"],
+                            "attempt_count": 1,
+                        })
+                    pos["current_stage"] = f"PENDING EXIT: LOWER_CIRCUIT_DEFERRED: {exit_reason}"
                     if not is_same_day_rerun:
                         pos["bars_held"] = pos.get("bars_held", 0) + 1
-                    actions_taken.append(f"⚠️ PENDING EXIT: {sym} locked in Lower Circuit. Exit deferred to next session.")
+                    actions_taken.append(
+                        f"⚠️ PENDING EXIT QUEUED: {sym} locked in Lower Circuit ({exit_reason}). "
+                        "Exit queued to execute at first liquid session open."
+                    )
                     if high_p > prior_peak:
                         pos["peak_price"] = high_p
                         pos["peak_gain_pct"] = (high_p / entry_p - 1.0) * 100.0
@@ -600,6 +617,11 @@ class LivePortfolioManager:
                         or "Dead Money" in exit_reason
                         or "100 EMA Break" in exit_reason
                         or "50 EMA Locked" in exit_reason
+                        or "Parabolic Climax" in exit_reason
+                        or "Secular Trend Ended" in exit_reason
+                        or "Unresolved >35% Drop" in exit_reason
+                        or "QUARANTINE" in exit_reason
+                        or "LOWER_CIRCUIT" in exit_reason
                     )
                     if is_close_based or not self.assumed_gtt_stops:
                         already_pending = any(pe["symbol"] == sym for pe in self.state.pending_exits)
@@ -674,7 +696,7 @@ class LivePortfolioManager:
                 sym = str(row["symbol"]).upper().replace(".NS", "").replace(".BO", "").strip()
                 if sym in self.state.active_positions or sym in queued_syms or _bar_today(sym) is None:
                     continue  # no bar today -> stale signal, never queue
-                if bool(row.get("is_corporate_anomaly", False)) or any(p.get("quarantined") for s, p in self.state.active_positions.items() if s == sym):
+                if bool(row.get("is_corporate_anomaly", False)) or any(p.get("is_quarantined") for s, p in self.state.active_positions.items() if s == sym):
                     actions_taken.append(f"⛔ CANDIDATE BLOCKED: {sym} has unadjusted corporate action anomaly")
                     continue
                 self.state.pending_entries.append({

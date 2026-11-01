@@ -16,6 +16,7 @@ def validate_ohlcv(
     frame: pd.DataFrame,
     *,
     tag_microstructure: bool = False,
+    tag_corporate_anomalies: bool = False,
     clean_glitches: bool = True,
 ) -> pd.DataFrame:
     """Validate daily OHLCV rows and return a sorted copy.
@@ -32,12 +33,16 @@ def validate_ohlcv(
     missing = sorted(set(REQUIRED_COLUMNS) - set(frame.columns))
     if missing:
         raise MarketDataError(f"Missing required columns: {', '.join(missing)}")
-    result = frame.loc[:, REQUIRED_COLUMNS].copy()
+    # Preserve all existing columns (do not drop metadata or corporate action tags)
+    result = frame.copy()
     if result.empty:
         result["date"] = pd.to_datetime(result["date"], errors="coerce", utc=True)
         if tag_microstructure:
             result["is_zero_volume"] = pd.Series(dtype=bool)
             result["is_circuit_locked"] = pd.Series(dtype=bool)
+        if tag_corporate_anomalies:
+            result["is_corporate_anomaly"] = pd.Series(dtype=bool)
+            result["anomaly_reason"] = pd.Series(dtype="string")
         return result
 
     result["date"] = pd.to_datetime(result["date"], errors="coerce", utc=True)
@@ -90,6 +95,9 @@ def validate_ohlcv(
             & (sorted_result["high"] == sorted_result["low"])
             & (sorted_result["low"] == sorted_result["close"])
         )
+
+    if tag_corporate_anomalies:
+        sorted_result = detect_corporate_action_anomalies(sorted_result)
 
     return sorted_result
 
@@ -186,7 +194,15 @@ def clean_transient_price_spikes(
     )
 
     # 2. Extreme impossible single-day flat jumps/drops (e.g. CIPLA flat tick):
-    flat_extreme_glitch = is_flat_tick & ((ratio_close > spike_up_threshold) | (ratio_close < spike_down_threshold))
+    # Require confirming evidence that it is a data print error, not a genuine split or real market move:
+    # - If volume is zero or near-zero (< 500 shares), a >2x or <0.5x flat print is a bad tick.
+    # - If volume is substantial, only an extreme impossible ratio (>10.0 or <0.10, e.g. CIPLA 12.5x drop) is repaired.
+    # Real 2:1 or 3:1 splits with real traded volume are NOT rewritten here; they belong in corporate action detection.
+    low_vol = (sorted_df["volume"] < 500) if has_vol else pd.Series(True, index=sorted_df.index)
+    flat_extreme_glitch = is_flat_tick & (
+        (low_vol & ((ratio_close > spike_up_threshold) | (ratio_close < spike_down_threshold)))
+        | ((ratio_close > 10.0) | (ratio_close < 0.10))
+    )
 
     # 3. Intraday needle spikes (fat-finger tick where open and close are normal, but high or low spikes):
     if has_hl and has_op:

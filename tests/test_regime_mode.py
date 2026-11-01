@@ -85,7 +85,7 @@ def test_regime_blocks_entries_with_insufficient_history(tmp_path):
 def test_engine_exit_execution_mode_options():
     eng_def = UpgradedVCPBacktestEngine()
     assert eng_def.exit_execution_mode == "NEXT_OPEN"
-    assert eng_def.assumed_gtt_stops is True
+    assert eng_def.assumed_gtt_stops is False
 
     eng_same = UpgradedVCPBacktestEngine(exit_execution_mode="SAME_BAR_CLOSE")
     assert eng_same.exit_execution_mode == "SAME_BAR_CLOSE"

@@ -57,8 +57,13 @@ def test_pending_orders_survive_state_reload(temp_portfolio, tmp_path):
 
 def test_execution_tranche1_and_exit(temp_portfolio):
     fill = _enter(temp_portfolio)
-    # -10% hard stop hit on the following session
+    # -10% hard stop hit on 2026-10-28: without broker GTT, queues into pending_exits at EOD
     temp_portfolio.execute_daily_rebalance(_bar("2026-10-28", 920.0, 930.0, 890.0, 895.0), BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert temp_portfolio.get_summary()["active_positions_count"] == 1
+
+    # Next session open (2026-10-29): Fills at open 895.0
+    temp_portfolio.execute_daily_rebalance(_bar("2026-10-29", 895.0, 900.0, 890.0, 895.0), BENCH, pd.DataFrame(), current_date_str="2026-10-29")
     assert temp_portfolio.get_summary()["active_positions_count"] == 0
     assert len(temp_portfolio.state.closed_trades) == 1
     assert "Extreme Circuit Breaker" in temp_portfolio.state.closed_trades[0]["exit_reason"]
@@ -98,8 +103,11 @@ def test_unresolved_corporate_action_drop_is_force_exited_after_three_sessions(t
     _enter(temp_portfolio)
     for d in ("2026-10-28", "2026-10-29", "2026-10-30"):
         temp_portfolio.execute_daily_rebalance(_bar(d, 600.0, 640.0, 590.0, 610.0), BENCH, pd.DataFrame(), current_date_str=d)
-    assert temp_portfolio.get_summary()["active_positions_count"] == 0
-    assert "forced exit" in temp_portfolio.state.closed_trades[-1]["exit_reason"]
+    # Suspected unadjusted corporate action drop (>35%) in live stays quarantined for review, not blindly panic-sold
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    assert pos["is_quarantined"] is True
+    assert "Quarantine" in pos["current_stage"]
+    assert len(temp_portfolio.state.closed_trades) == 0
 
 
 def test_live_fill_is_capped_by_adv(temp_portfolio):
@@ -280,3 +288,72 @@ def test_quarantined_candidate_blocked_from_entry(temp_portfolio):
 
     assert temp_portfolio.state.pending_entries == []
     assert any("CANDIDATE BLOCKED" in a and "ANOMALY" in a for a in res["actions_taken"])
+
+
+def test_circuit_deferred_exit_not_lost_on_rebound(temp_portfolio):
+    """When stop is triggered on a lower-circuit day, exit must queue and execute at next open even if stock rebounds."""
+    _enter(temp_portfolio)
+
+    # Day 3: Stock locks lower-circuit at 880.0 (hard stop is 900.0, prev close 1000.0)
+    b3_lc = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 880.0, "high": 880.0, "low": 880.0, "close": 880.0, "volume": 500,
+        "prev_close": 1000.0,
+    }])
+    temp_portfolio.execute_daily_rebalance(b3_lc, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    # Lower circuit deferral MUST add to pending_exits so the signal is not lost
+    assert len(temp_portfolio.state.pending_exits) == 1
+    pe = temp_portfolio.state.pending_exits[0]
+    assert "LOWER_CIRCUIT_DEFERRED" in pe["exit_reason"]
+    assert temp_portfolio.get_summary()["active_positions_count"] == 1
+
+    # Day 4: Market opens at 885.0 (liquid, not locked), and then rebounds to 950.0!
+    b4_rebound = pd.DataFrame([{
+        "date": "2026-10-29", "symbol": "DIXON",
+        "open": 885.0, "high": 950.0, "low": 880.0, "close": 940.0, "volume": 500_000,
+        "prev_close": 880.0,
+    }])
+    temp_portfolio.execute_daily_rebalance(b4_rebound, BENCH, pd.DataFrame(), current_date_str="2026-10-29")
+
+    # Trade MUST have executed at open (885.0) and NOT be lost due to the intraday rebound
+    assert temp_portfolio.get_summary()["active_positions_count"] == 0
+    assert len(temp_portfolio.state.closed_trades) == 1
+    assert temp_portfolio.state.closed_trades[0]["exit_price"] == 885.0
+    assert len(temp_portfolio.state.pending_exits) == 0
+
+
+def test_parabolic_climax_exit_queues_for_next_open(temp_portfolio):
+    """Stage 5 Parabolic Climax exit is evaluated at close and must queue for next open."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["peak_price"] = 2200.0  # +120% gain
+    pos["is_climax_reached"] = True
+
+    # Day 3: Climax drop -26% from peak (2200 -> 1620)
+    b3 = _bar("2026-10-28", 1700.0, 1720.0, 1600.0, 1620.0)
+    temp_portfolio.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert "Parabolic Climax" in temp_portfolio.state.pending_exits[0]["exit_reason"]
+    assert temp_portfolio.get_summary()["active_positions_count"] == 1
+
+
+def test_corporate_action_quarantine_manual_review_in_live(temp_portfolio):
+    """Suspected unadjusted corporate action drop (>35%) in live must quarantine for manual review without panic sell."""
+    _enter(temp_portfolio)
+
+    # Day 3: Unadjusted demerger drop (-45% from entry 1000 to 550) with normal volume
+    b3 = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 550.0, "high": 560.0, "low": 540.0, "close": 550.0, "volume": 50_000,
+        "prev_close": 1000.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    assert pos["is_quarantined"] is True
+    assert "Quarantine" in pos["current_stage"]
+    assert len(temp_portfolio.state.pending_exits) == 0
+    assert len(temp_portfolio.state.closed_trades) == 0
+    assert any("QUARANTINE" in a for a in res["actions_taken"])

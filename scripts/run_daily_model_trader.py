@@ -149,7 +149,7 @@ def run_daily_autonomous_trader(
               "Refresh data (--sync-live) or raise --max-stale-days. Aborting.")
         return
     recent_bars = bars_df[bars_df["date"] >= (max_dt - pd.Timedelta(days=730))].copy()
-    recent_bars = validate_ohlcv(recent_bars, clean_glitches=True)
+    recent_bars = validate_ohlcv(recent_bars, clean_glitches=True, tag_corporate_anomalies=True)
     recent_bench = bench_df[bench_df["date"] >= (max_dt - pd.Timedelta(days=730))].copy()
 
     print(f"Loaded {len(recent_bars):,} bars across {recent_bars['symbol'].nunique()} equities up to {max_dt.strftime('%Y-%m-%d')}.")
@@ -176,6 +176,7 @@ def run_daily_autonomous_trader(
         statutory_bps=52.6,
         max_pct_of_adv=10.0,
         regime_mode=regime_mode,
+        assumed_gtt_stops=False,
     )
 
     if reset_state:

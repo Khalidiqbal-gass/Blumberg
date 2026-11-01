@@ -93,7 +93,7 @@ def test_bear_market_regime_blocks_entries():
     prices = [100.0] * 40 + [102.0, 105.0, 110.0, 115.0] + [120.0] * 56
     bars = _generate_vcp_bars("TEST", dates, prices)
 
-    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0)
+    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0, assumed_gtt_stops=True)
     summary = engine.run_backtest(bars, bench)
 
     # In bear regime, trades should be completely blocked
@@ -111,7 +111,7 @@ def test_stage_1_closing_stop_and_dead_money_exit():
     spreads = [0.04] * 25 + [0.008] * 65  # VCP contraction
     bars = _generate_vcp_bars("STAGNANT", dates, prices, high_spread=spreads, volume_pattern=vols)
 
-    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0)
+    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0, assumed_gtt_stops=True)
     summary = engine.run_backtest(bars, bench)
 
     assert summary.total_trades >= 1
@@ -131,7 +131,7 @@ def test_stage_2_breakeven_floor_locks_profit():
     spreads = [0.04] * 25 + [0.01] * 65  # VCP contraction
     bars = _generate_vcp_bars("RUNNER", dates, prices, high_spread=spreads, volume_pattern=vols)
 
-    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0)
+    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0, assumed_gtt_stops=True)
     summary = engine.run_backtest(bars, bench)
 
     assert summary.total_trades >= 1
@@ -156,7 +156,7 @@ def test_stage_5_parabolic_climax_exit():
     spreads = [0.04] * 25 + [0.01] * 115  # VCP contraction
     bars = _generate_vcp_bars("ROCKET", dates, prices, high_spread=spreads, volume_pattern=vols)
 
-    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0)
+    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0, assumed_gtt_stops=True)
     summary = engine.run_backtest(bars, bench)
 
     assert summary.total_trades >= 1
@@ -223,3 +223,26 @@ def test_dd_brake_is_off_by_default_and_configurable():
     assert UpgradedVCPBacktestEngine().dd_brake_pct is None
     e = UpgradedVCPBacktestEngine(dd_brake_pct=30.0)
     assert e.dd_brake_pct == 30.0 and e.dd_resume_pct == 15.0
+
+
+def test_backtest_assumed_gtt_stops_false_queues_intraday_stop_to_next_open():
+    """When assumed_gtt_stops=False, intraday stops queue to NEXT_OPEN and fill at next open."""
+    dates = pd.date_range("2023-01-01", periods=60, freq="B", tz="UTC")
+    bench = _generate_synthetic_benchmark(dates, trend="bull")
+
+    # Breakout at bar 40 with volume (entry ~103.0), then on bar 42 drops intraday to 88.0 (low <= hard stop 90.0)
+    # Next day (bar 43) opens at 89.0
+    prices = [100.0] * 40 + [103.0, 105.0, 89.5, 89.0] + [85.0] * 16
+    vols = [500_000.0] * 40 + [3_000_000.0, 2_000_000.0] + [500_000.0] * 18
+    spreads = [0.04] * 25 + [0.01] * 35
+    bars = _generate_vcp_bars("STOPPED", dates, prices, high_spread=spreads, volume_pattern=vols)
+
+    # Default assumed_gtt_stops is False
+    engine = UpgradedVCPBacktestEngine(min_turnover_rs=1_000_000.0, assumed_gtt_stops=False)
+    assert engine.assumed_gtt_stops is False
+    res = engine.run_backtest(bars, bench)
+
+    assert res.total_trades >= 1
+    t = res.trades_df.iloc[0]
+    # Trade filled at bar 43 open (not same-day close)
+    assert "NEXT_OPEN" in engine.exit_execution_mode
