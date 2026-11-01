@@ -1,0 +1,4 @@
+Regime Mode,Description,Final Capital (Rs),Multiple,CAGR (%),Max DD (%),Total Trades,Win Rate (%),Profit Factor,Payoff Ratio,Total Friction (Rs)
+OR,Baseline (>50 OR >200),269883539.5,269.88,23.23,-43.81,661,25.11,2.26,8.79,85118839.48
+AND,Strict (>50 AND >200),87346287.69,87.35,18.15,-33.17,636,26.57,2.33,5.91,26428655.24
+AND_TREND,Trend (>50 AND >200 & 50>200),65895985.43,65.9,16.91,-32.81,583,24.36,2.36,6.84,18848534.73

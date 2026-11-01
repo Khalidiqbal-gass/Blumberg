@@ -120,6 +120,7 @@ class UpgradedVCPBacktestEngine:
         dd_resume_pct: float | None = None,  # resume when drawdown recovers to this % (default: half of dd_brake_pct)
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg daily turnover (None = unlimited, legacy optimism)
         clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does
+        regime_mode: str = "OR",  # "OR" (baseline: >50 OR >200), "AND" (strict: >50 AND >200), "AND_TREND" (>50 AND >200 AND 50>200)
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -138,6 +139,7 @@ class UpgradedVCPBacktestEngine:
         self.stale_exit_sessions = stale_exit_sessions
         self.clean_glitches = clean_glitches
         self.max_pct_of_adv = max_pct_of_adv
+        self.regime_mode = regime_mode.upper()
         self.dd_brake_pct = dd_brake_pct
         self.dd_resume_pct = dd_resume_pct if dd_resume_pct is not None else (dd_brake_pct / 2.0 if dd_brake_pct else None)
 
@@ -253,7 +255,12 @@ class UpgradedVCPBacktestEngine:
         bench = bench.sort_values("date").reset_index(drop=True)
         bench["ema50"] = bench["close"].ewm(span=50, adjust=False).mean()
         bench["ema200"] = bench["close"].ewm(span=200, adjust=False).mean()
-        bench["regime_ok"] = (bench["close"] > bench["ema50"]) | (bench["close"] > bench["ema200"])
+        if self.regime_mode == "AND":
+            bench["regime_ok"] = (bench["close"] > bench["ema50"]) & (bench["close"] > bench["ema200"])
+        elif self.regime_mode == "AND_TREND":
+            bench["regime_ok"] = (bench["close"] > bench["ema50"]) & (bench["close"] > bench["ema200"]) & (bench["ema50"] > bench["ema200"])
+        else:
+            bench["regime_ok"] = (bench["close"] > bench["ema50"]) | (bench["close"] > bench["ema200"])
         bench_regime_dict = bench.set_index("date")["regime_ok"].to_dict()
         bench_close_dict = bench.set_index("date")["close"].to_dict()
         bench_series = bench.set_index("date")["close"]

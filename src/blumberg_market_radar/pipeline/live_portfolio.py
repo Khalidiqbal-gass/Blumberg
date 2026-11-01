@@ -102,6 +102,7 @@ class LivePortfolioManager:
         statutory_bps: float = 52.6,
         cash_yield_pct_p_a: float = 6.5,
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg turnover (same as backtest)
+        regime_mode: str = "OR",  # "OR" (baseline: >50 OR >200), "AND" (strict: >50 AND >200), "AND_TREND" (>50 AND >200 AND 50>200)
     ):
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,6 +111,7 @@ class LivePortfolioManager:
         self.tranche2_days = tranche2_days
         self.cost_per_side = (slippage_bps + statutory_bps) / 10_000.0
         self.max_pct_of_adv = max_pct_of_adv
+        self.regime_mode = regime_mode.upper()
         # FIX: compound daily yield matches engine formula: (1 + r_annual)^(1/252) - 1
         # Old formula (r/252) gives ~6.72% effective annual yield when compounded daily instead of 6.50%.
         self.cash_yield_daily = (
@@ -235,7 +237,12 @@ class LivePortfolioManager:
                 bench_close = bench_sorted["close"].iloc[-1]
                 bench_ema50 = bench_sorted["close"].ewm(span=50, adjust=False).mean().iloc[-1]
                 bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1] if len(bench_sorted) >= 200 else bench_ema50
-                regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
+                if self.regime_mode == "AND":
+                    regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200))
+                elif self.regime_mode == "AND_TREND":
+                    regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200) and (bench_ema50 > bench_ema200))
+                else:
+                    regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
 
         # Accrue daily cash yield (Only once per calendar day)
         if not is_same_day_rerun:

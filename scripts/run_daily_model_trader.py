@@ -111,6 +111,7 @@ def run_daily_autonomous_trader(
     reset_state: bool = False,
     min_price: float = 0.0,
     max_stale_days: int = 4,
+    regime_mode: str = "OR",
 ) -> None:
     print("=" * 100)
     print("   BLUMBERG AUTONOMOUS MODEL TRADER — HYBRID_50_50 CHAMPION REBALANCE")
@@ -174,6 +175,7 @@ def run_daily_autonomous_trader(
         slippage_bps=50.0,
         statutory_bps=52.6,
         max_pct_of_adv=10.0,
+        regime_mode=regime_mode,
     )
 
     if reset_state:
@@ -255,6 +257,8 @@ if __name__ == "__main__":
                         help="Minimum close price filter (default 0 = backtest parity; backtest has no price floor)")
     parser.add_argument("--max-stale-days", type=int, default=4,
                         help="Abort if the latest market bar is older than this many calendar days")
+    parser.add_argument("--regime-mode", choices=["OR", "AND", "AND_TREND"], default="OR",
+                        help="Regime filter logic: OR, AND, or AND_TREND")
     args = parser.parse_args()
 
     run_daily_autonomous_trader(
@@ -265,4 +269,5 @@ if __name__ == "__main__":
         reset_state=args.reset_state,
         min_price=args.min_price,
         max_stale_days=args.max_stale_days,
+        regime_mode=args.regime_mode,
     )
