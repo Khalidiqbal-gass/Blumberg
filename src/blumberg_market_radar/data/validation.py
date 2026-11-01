@@ -146,16 +146,18 @@ def clean_transient_price_spikes(
     reversion_min: float = 0.7,
     reversion_max: float = 1.4,
 ) -> tuple[pd.DataFrame, int]:
-    """Detect and repair transient single-session data glitches (bad ticks/unadjusted spikes).
+    """Detect and repair transient single-session data glitches causally without lookahead.
 
-    A transient glitch occurs when a single bar jumps >2x or falls <0.5x relative to prior close,
-    but the subsequent bar reverts back within [reversion_min, reversion_max] of the prior close.
-    Such glitches poison 52-week highs and corrupt ATR stops.
+    Glitch patterns detected using strictly contemporaneous / backward-looking evidence (Day <= D):
+    1. Zero-volume flat spikes: volume == 0 and open == high == low == close with jump (>1.3) or drop (<0.7) relative to prior close.
+    2. Extreme flat print glitches: open == high == low == close with jump (>spike_up_threshold) or drop (<spike_down_threshold).
+       (e.g. CIPLA 2003-04-14 single-day 12.5x flat print drop).
+    3. Aberrant intraday needle spikes: open and close are normal relative to prior close [reversion_min, reversion_max],
+       but high jumps > max(open, close) * spike_up_threshold or low drops < min(open, close) * spike_down_threshold.
 
-    FIX (Lookahead): Detection uses shift(-1) only to CONFIRM reversion (not to alter future bars).
-    Repair interpolates using ONLY the prior close (c_prev) — no future data enters the repaired price.
-    The last bar of each symbol can never be glitch-tagged (c_next is NaN), which is correct behaviour
-    in live trading where the future close is unknown.
+    Causality guarantee:
+    Every decision at Day D depends ONLY on bars <= D. Day D output is 100% bit-for-bit identical whether
+    Day D+1 data is present or absent. Future data is never used to confirm or alter past signals.
 
     Returns (cleaned_df, num_repaired_bars).
     """
@@ -164,29 +166,66 @@ def clean_transient_price_spikes(
 
     sorted_df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
     c_prev = sorted_df.groupby("symbol")["close"].shift(1)
-    # c_next is used ONLY as a confirmation signal (reversion check), NOT for imputing the repaired price.
-    # This means the last bar of any symbol is never cleaned (c_next == NaN → mask is False). Correct.
-    c_next = sorted_df.groupby("symbol")["close"].shift(-1)
 
-    ratio_high = sorted_df["high"] / c_prev
-    ratio_low = sorted_df["low"] / c_prev
-    ratio_next = c_next / c_prev
+    has_hl = "high" in sorted_df.columns and "low" in sorted_df.columns
+    has_op = "open" in sorted_df.columns
+    has_vol = "volume" in sorted_df.columns
 
-    is_spike_up = (ratio_high > spike_up_threshold) & (ratio_next >= reversion_min) & (ratio_next <= reversion_max)
-    is_spike_down = (ratio_low < spike_down_threshold) & (ratio_next >= reversion_min) & (ratio_next <= reversion_max)
-    mask_glitch = is_spike_up | is_spike_down
+    ratio_close = sorted_df["close"] / c_prev
+    is_flat_tick = (
+        (sorted_df["high"] == sorted_df["low"]) & (sorted_df["open"] == sorted_df["close"])
+        if (has_hl and has_op)
+        else pd.Series(False, index=sorted_df.index)
+    )
 
+    # 1. Zero volume flat ticks with ratio jump/drop:
+    zero_vol_anomaly = (
+        (sorted_df["volume"] == 0) & is_flat_tick & ((ratio_close > 1.3) | (ratio_close < 0.7))
+        if has_vol
+        else pd.Series(False, index=sorted_df.index)
+    )
+
+    # 2. Extreme impossible single-day flat jumps/drops (e.g. CIPLA flat tick):
+    flat_extreme_glitch = is_flat_tick & ((ratio_close > spike_up_threshold) | (ratio_close < spike_down_threshold))
+
+    # 3. Intraday needle spikes (fat-finger tick where open and close are normal, but high or low spikes):
+    if has_hl and has_op:
+        ratio_open = sorted_df["open"] / c_prev
+        normal_oc = (
+            (ratio_open >= reversion_min)
+            & (ratio_open <= reversion_max)
+            & (ratio_close >= reversion_min)
+            & (ratio_close <= reversion_max)
+        )
+        needle_down = normal_oc & (
+            sorted_df["low"] < np.minimum(sorted_df["open"], sorted_df["close"]) * spike_down_threshold
+        )
+        needle_up = normal_oc & (
+            sorted_df["high"] > np.maximum(sorted_df["open"], sorted_df["close"]) * spike_up_threshold
+        )
+    else:
+        needle_down = pd.Series(False, index=sorted_df.index)
+        needle_up = pd.Series(False, index=sorted_df.index)
+
+    mask_glitch = zero_vol_anomaly | flat_extreme_glitch | needle_down | needle_up
     num_glitches = int(mask_glitch.sum())
     if num_glitches == 0:
         return sorted_df, 0
 
     cleaned = sorted_df.copy()
-    # FIX: Repair price uses ONLY c_prev (causal). Old code averaged (c_prev + c_next) / 2,
-    # which injected future price information into the repaired bar's OHLC values.
-    repair_price = c_prev.loc[mask_glitch]
-    cleaned.loc[mask_glitch, "open"] = repair_price
-    cleaned.loc[mask_glitch, "high"] = repair_price * 1.005
-    cleaned.loc[mask_glitch, "low"] = repair_price * 0.995
-    cleaned.loc[mask_glitch, "close"] = repair_price
+    full_repair = (zero_vol_anomaly | flat_extreme_glitch) & mask_glitch
+    rp = c_prev.loc[full_repair]
+    cleaned.loc[full_repair, "open"] = rp
+    cleaned.loc[full_repair, "high"] = rp * 1.005
+    cleaned.loc[full_repair, "low"] = rp * 0.995
+    cleaned.loc[full_repair, "close"] = rp
+
+    if has_hl and has_op:
+        cleaned.loc[needle_down, "low"] = (
+            np.minimum(cleaned.loc[needle_down, "open"], cleaned.loc[needle_down, "close"]) * 0.995
+        )
+        cleaned.loc[needle_up, "high"] = (
+            np.maximum(cleaned.loc[needle_up, "open"], cleaned.loc[needle_up, "close"]) * 1.005
+        )
 
     return cleaned, num_glitches

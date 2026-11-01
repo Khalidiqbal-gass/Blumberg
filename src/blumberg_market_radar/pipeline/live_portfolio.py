@@ -87,6 +87,7 @@ class LivePortfolioState:
     last_rebalance_date: str = ""
     created_at: str = ""
     pending_entries: list[dict] = field(default_factory=list)  # signals to be filled at the NEXT session open
+    pending_exits: list[dict] = field(default_factory=list)  # exit orders queued at EOD to fill at NEXT session open
 
 
 class LivePortfolioManager:
@@ -102,7 +103,8 @@ class LivePortfolioManager:
         statutory_bps: float = 52.6,
         cash_yield_pct_p_a: float = 6.5,
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg turnover (same as backtest)
-        regime_mode: str = "OR",  # "OR" (baseline: >50 OR >200), "AND" (strict: >50 AND >200), "AND_TREND" (>50 AND >200 AND 50>200)
+        regime_mode: str = "AND",  # Default strict "AND" (Close > 50 AND > 200 EMA); "OR" and "AND_TREND" optional
+        assumed_gtt_stops: bool = True,  # True = intraday stops filled via active broker GTT; False = EOD queue to next open
     ):
         self.state_path = Path(state_path)
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +113,7 @@ class LivePortfolioManager:
         self.tranche2_days = tranche2_days
         self.cost_per_side = (slippage_bps + statutory_bps) / 10_000.0
         self.max_pct_of_adv = max_pct_of_adv
+        self.assumed_gtt_stops = assumed_gtt_stops
         self.regime_mode = str(regime_mode).upper()
         if self.regime_mode not in ("OR", "AND", "AND_TREND"):
             raise ValueError(f"Invalid regime_mode {regime_mode!r}; expected OR, AND or AND_TREND")
@@ -138,6 +141,7 @@ class LivePortfolioManager:
                     last_rebalance_date=data.get("last_rebalance_date", ""),
                     created_at=data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                     pending_entries=data.get("pending_entries", []),
+                    pending_exits=data.get("pending_exits", []),
                 )
             except Exception as exc:
                 logger.warning(f"Could not parse state file: {exc}. Starting fresh.")
@@ -210,6 +214,8 @@ class LivePortfolioManager:
             "total_pnl_rs": total_pnl,
             "total_return_pct": total_return_pct,
             "active_positions_count": len(self.state.active_positions),
+            "pending_exits_count": len(self.state.pending_exits),
+            "pending_entries_count": len(self.state.pending_entries),
             "max_slots": self.max_slots,
             "available_slots": max(0, self.max_slots - len(self.state.active_positions)),
             "total_closed_trades": total_closed,
@@ -303,6 +309,66 @@ class LivePortfolioManager:
         # Cash/slots are those available before today's exits (T+1 settlement), exactly like the engine.
         fills_today: set[str] = set()
         if not is_same_day_rerun:
+            # 00. Pending Exits queued at previous session's close fill at TODAY'S OPEN
+            if self.state.pending_exits:
+                remaining_pending_exits = []
+                for pe in self.state.pending_exits:
+                    psym = pe["symbol"]
+                    pos = self.state.active_positions.get(psym)
+                    if pos is None:
+                        continue
+                    b = _bar_today(psym)
+                    if b is None:
+                        pe["attempt_count"] = pe.get("attempt_count", 0) + 1
+                        remaining_pending_exits.append(pe)
+                        actions_taken.append(f"⚠️ PENDING EXIT HELD: {psym} had no session bar today. Retrying next session.")
+                        continue
+
+                    open_p = float(b["open"])
+                    low_p = float(b["low"])
+                    high_p = float(b["high"])
+                    close_p = float(b["close"])
+                    prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else float(pos.get("current_price", open_p))
+                    is_lower_circuit = (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)
+
+                    if is_lower_circuit:
+                        pe["attempt_count"] = pe.get("attempt_count", 0) + 1
+                        remaining_pending_exits.append(pe)
+                        actions_taken.append(f"⚠️ PENDING EXIT DEFERRED: {psym} locked in Lower Circuit at open ₹{open_p:.2f}. Retrying next session.")
+                        continue
+
+                    fill_price = open_p
+                    shares = float(pos["shares"])
+                    sell_friction = fill_price * shares * self.cost_per_side
+                    net_proceeds = (fill_price * shares) - sell_friction
+                    self.state.cash += net_proceeds
+
+                    net_ret = (fill_price * (1.0 - self.cost_per_side) / pos["entry_price_with_friction"] - 1.0) * 100.0
+                    net_pnl = net_proceeds - float(pos["invested_capital"])
+
+                    closed_rec = ClosedTradeRecord(
+                        symbol=psym,
+                        entry_date=pos["entry_date"],
+                        exit_date=today_date,
+                        shares=shares,
+                        entry_price=float(pos["entry_price"]),
+                        exit_price=fill_price,
+                        gross_return_pct=(fill_price / float(pos["entry_price"]) - 1.0) * 100.0,
+                        net_return_pct=net_ret,
+                        net_pnl_rs=net_pnl,
+                        exit_reason=pe["exit_reason"],
+                        stage_at_exit=pe.get("stage_at_signal", pos.get("current_stage", "")),
+                        bars_held=int(pos.get("bars_held", 0)),
+                        sector=str(pos.get("sector", "Diversified")),
+                    )
+                    self.state.closed_trades.append(asdict(closed_rec))
+                    del self.state.active_positions[psym]
+                    actions_taken.append(
+                        f"🔴 EXIT FILLED (at Open): {psym} exited at open ₹{fill_price:.2f} ({net_ret:+.1f}%) | Reason: {pe['exit_reason']}"
+                    )
+
+                self.state.pending_exits = remaining_pending_exits
+
             # 0a. Tranche 2 (flagged eligible at yesterday's close) fills at today's open
             for sym, pos in list(self.state.active_positions.items()):
                 if pos.get("tranche2_eligible") and not pos.get("tranche2_active", False):
@@ -399,6 +465,7 @@ class LivePortfolioManager:
 
             # Same anchor as backtest: blended raw entry (friction-free) for milestones, stops and floors
             entry_p = float(pos["entry_price"])
+            prev_recorded_price = pos.get("current_price")
             prior_peak = float(pos.get("peak_price", entry_p))
             gain_from_entry = (prior_peak / entry_p - 1.0) * 100.0
 
@@ -477,7 +544,11 @@ class LivePortfolioManager:
 
                 # Demerger / Corporate Action anomaly check (LIVE-ONLY safety): a >35% single-day drop on an
                 # unadjusted corporate action (e.g. VEDL demerger) must not trigger a blind panic exit.
-                is_corp_action_anomaly = (low_p <= entry_p * 0.65) and (prior_peak >= entry_p * 0.95)
+                is_corp_action_anomaly = (
+                    ("is_corporate_anomaly" in bar and bool(bar["is_corporate_anomaly"]))
+                    or (low_p <= entry_p * 0.65 and prior_peak >= entry_p * 0.95)
+                    or (prev_recorded_price is not None and float(prev_recorded_price) > 0 and (low_p / float(prev_recorded_price) - 1.0) <= -0.35)
+                )
 
                 if is_corp_action_anomaly:
                     if not is_same_day_rerun:
@@ -524,7 +595,30 @@ class LivePortfolioManager:
                         pos["peak_price"] = high_p
                         pos["peak_gain_pct"] = (high_p / entry_p - 1.0) * 100.0
                 else:
-                    symbols_to_close.append((sym, exit_price, exit_reason, stage_name))
+                    is_close_based = (
+                        "Closing Stop" in exit_reason
+                        or "Dead Money" in exit_reason
+                        or "100 EMA Break" in exit_reason
+                        or "50 EMA Locked" in exit_reason
+                    )
+                    if is_close_based or not self.assumed_gtt_stops:
+                        already_pending = any(pe["symbol"] == sym for pe in self.state.pending_exits)
+                        if not already_pending and not is_same_day_rerun:
+                            self.state.pending_exits.append({
+                                "symbol": sym,
+                                "signal_date": today_date,
+                                "exit_reason": exit_reason,
+                                "stage_at_signal": stage_name,
+                                "signal_price": close_p,
+                                "shares": pos["shares"],
+                                "attempt_count": 0,
+                            })
+                            pos["current_stage"] = f"PENDING EXIT: {exit_reason}"
+                            actions_taken.append(
+                                f"📋 EXIT SIGNAL QUEUED: {sym} ({exit_reason}) -> queued to sell at next session open"
+                            )
+                    else:
+                        symbols_to_close.append((sym, exit_price, exit_reason + " [Broker GTT Assumed]", stage_name))
             else:
                 # Update peak only if trade survived session
                 if not is_same_day_rerun:
@@ -580,6 +674,9 @@ class LivePortfolioManager:
                 sym = str(row["symbol"]).upper().replace(".NS", "").replace(".BO", "").strip()
                 if sym in self.state.active_positions or sym in queued_syms or _bar_today(sym) is None:
                     continue  # no bar today -> stale signal, never queue
+                if bool(row.get("is_corporate_anomaly", False)) or any(p.get("quarantined") for s, p in self.state.active_positions.items() if s == sym):
+                    actions_taken.append(f"⛔ CANDIDATE BLOCKED: {sym} has unadjusted corporate action anomaly")
+                    continue
                 self.state.pending_entries.append({
                     "symbol": sym,
                     "signal_date": today_date,

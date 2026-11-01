@@ -63,6 +63,9 @@ class UpgradedTrade:
     is_climax_reached: bool = False
     status: str = "Open"
     sector: str = ""
+    anomaly_days: int = 0
+    is_quarantined: bool = False
+    pending_exit: bool = False
 
 
 @dataclass
@@ -120,7 +123,9 @@ class UpgradedVCPBacktestEngine:
         dd_resume_pct: float | None = None,  # resume when drawdown recovers to this % (default: half of dd_brake_pct)
         max_pct_of_adv: float | None = 10.0,  # cap each fill at this % of 20d avg daily turnover (None = unlimited, legacy optimism)
         clean_glitches: bool = True,  # repair single-bar bad ticks exactly like the live/nightly ingestion path does
-        regime_mode: str = "OR",  # "OR" (baseline: >50 OR >200), "AND" (strict: >50 AND >200), "AND_TREND" (>50 AND >200 AND 50>200)
+        regime_mode: str = "AND",  # Default strict "AND" (Close > 50 AND > 200 EMA); "OR" and "AND_TREND" optional
+        assumed_gtt_stops: bool = True,  # True = intraday stops filled via active broker GTT; False = EOD queue to next open
+        exit_execution_mode: str = "NEXT_OPEN",  # "NEXT_OPEN" (realistic: EOD signals fill at next session open), "SAME_BAR_CLOSE" (legacy)
     ) -> None:
         self.initial_capital = initial_capital
         self.max_slots = max_slots
@@ -144,6 +149,10 @@ class UpgradedVCPBacktestEngine:
             raise ValueError(f"Invalid regime_mode {regime_mode!r}; expected OR, AND or AND_TREND")
         self.dd_brake_pct = dd_brake_pct
         self.dd_resume_pct = dd_resume_pct if dd_resume_pct is not None else (dd_brake_pct / 2.0 if dd_brake_pct else None)
+        self.assumed_gtt_stops = assumed_gtt_stops
+        self.exit_execution_mode = str(exit_execution_mode).upper()
+        if self.exit_execution_mode not in ("NEXT_OPEN", "SAME_BAR_CLOSE"):
+            raise ValueError(f"Invalid exit_execution_mode {exit_execution_mode!r}; expected NEXT_OPEN or SAME_BAR_CLOSE")
 
         # Total cost per side (Default: 20 bps slippage + 35 bps statutory = 55.0 bps per side;
         # Conservative stress-test mode uses 50 bps slippage + 52.6 bps statutory = 102.6 bps per side)
@@ -308,6 +317,7 @@ class UpgradedVCPBacktestEngine:
         brake_on = False
         last_px: dict[str, float] = {}   # last known close per held symbol (MTM when a bar is missing)
         missed_sessions: dict[str, int] = {}
+        pending_exits: dict[str, tuple[str, str]] = {}  # sym -> (exit_reason, stage_name)
         daily_cash_yield = (
             (1.0 + self.cash_yield_pct_p_a / 100.0) ** (1.0 / 252.0) - 1.0
             if self.cash_yield_pct_p_a > 0.0
@@ -318,6 +328,53 @@ class UpgradedVCPBacktestEngine:
             # Accrue overnight risk-free yield on uninvested cash (T-Bills / Liquid Funds)
             if cash > 0.0 and daily_cash_yield > 0.0:
                 cash += cash * daily_cash_yield
+
+            # 0. Execute pending exits from previous session at TODAY'S OPEN
+            if self.exit_execution_mode == "NEXT_OPEN" and pending_exits:
+                rem_pending = {}
+                for psym, (p_reason, p_stg) in pending_exits.items():
+                    if psym not in active_trades:
+                        continue
+                    s_df = symbol_data[psym]
+                    if cur_date not in s_df.index:
+                        rem_pending[psym] = (p_reason, p_stg)
+                        continue
+                    bar_open = s_df.loc[cur_date]
+                    prev_p = bar_open.get("prev_close")
+                    is_lc_open = (
+                        bar_open["open"] == bar_open["low"]
+                        and bar_open["high"] == bar_open["low"]
+                        and pd.notnull(prev_p)
+                        and bar_open["close"] < prev_p
+                    )
+                    if is_lc_open:
+                        rem_pending[psym] = (p_reason, p_stg)
+                        continue
+
+                    tr = active_trades[psym]
+                    exit_price = float(bar_open["open"])
+                    sell_friction = exit_price * tr.shares * self.cost_per_side
+                    net_proceeds = (exit_price * tr.shares) - sell_friction
+                    total_friction_paid += sell_friction
+                    cash += net_proceeds
+
+                    tr.exit_date = cur_date
+                    tr.exit_price = exit_price
+                    tr.exit_price_net = exit_price * (1.0 - self.cost_per_side)
+                    tr.exit_reason = p_reason
+                    tr.stage_at_exit = p_stg
+                    tr.peak_gain_pct = (tr.peak_price / tr.entry_price - 1.0) * 100.0
+                    tr.gross_return_pct = (exit_price / tr.entry_price - 1.0) * 100.0
+                    tr.net_return_pct = (tr.exit_price_net / tr.entry_price_with_friction - 1.0) * 100.0
+                    tr.pnl_amount = net_proceeds - tr.invested_capital
+                    tr.calendar_days = (cur_date - tr.entry_date).days
+                    tr.bars_held += 1
+                    tr.status = "Closed"
+
+                    closed_trades.append(tr)
+                    del active_trades[psym]
+
+                pending_exits = rem_pending
 
             # -------------------------------------------------------------
             # STEP 1: MORNING MARKET OPEN (9:15 AM) - NEW ENTRIES EXECUTION
@@ -449,6 +506,8 @@ class UpgradedVCPBacktestEngine:
                         continue
                     if prev_date in s_df.index and s_df.loc[prev_date, "raw_signal"]:
                         p_row = s_df.loc[prev_date]
+                        if bool(p_row.get("is_corporate_anomaly", False)):
+                            continue
                         cand_sec = str(p_row.get("sector", "")) if "sector" in p_row.index else ""
                         sec_rs = sector_rs_dict.get((prev_date, cand_sec), 0.0)
 
@@ -633,6 +692,34 @@ class UpgradedVCPBacktestEngine:
                 exit_reason = ""
                 stage_name = ""
 
+                # Corporate Action Anomaly Detection (splits/demergers unadjusted in raw feed):
+                # An extreme single-session drop (>35%) without liquidation volume indicates an unadjusted corporate action.
+                # Quarantine the symbol for review; if unresolved after 3 sessions, force exit with explicit audit reason.
+                is_corp_anomaly = False
+                prev_c = bar.get("prev_close") if "prev_close" in bar and pd.notnull(bar["prev_close"]) else None
+                if "is_corporate_anomaly" in bar and bool(bar["is_corporate_anomaly"]):
+                    is_corp_anomaly = True
+                elif prev_c is not None and prev_c > 0 and (bar["low"] / prev_c - 1.0) <= -0.35:
+                    vol_v = bar.get("volume", 0.0)
+                    adv_v = bar.get("adv_20", 0.0)
+                    vol_ratio = (vol_v / adv_v) if (pd.notnull(adv_v) and adv_v > 0) else 1.0
+                    if vol_ratio < 3.0:
+                        is_corp_anomaly = True
+                elif bar["low"] <= tr.entry_price * 0.65 and prior_peak >= tr.entry_price * 0.95:
+                    is_corp_anomaly = True
+
+                if is_corp_anomaly:
+                    tr.anomaly_days = getattr(tr, "anomaly_days", 0) + 1
+                    tr.is_quarantined = True
+                    if tr.anomaly_days >= 3:
+                        exit_triggered = True
+                        exit_price = bar["close"]
+                        exit_reason = "QUARANTINE_TIMEOUT: Unadjusted Demerger/Split (3 sessions)"
+                        stage_name = "Corporate Action Quarantine"
+                    else:
+                        tr.exit_reason = f"QUARANTINED_CORP_ACTION (day {tr.anomaly_days}/3)"
+                        continue
+
                 # Check Tranche 2 eligibility for tomorrow in HYBRID_50_50
                 if exec_mode == "HYBRID_50_50" and not tr.tranche2_active and tr.bars_held >= (self.tranche2_days - 1):
                     if bar["close"] > tr.entry_price and bar["low"] > tr.entry_price * 0.92:
@@ -709,8 +796,9 @@ class UpgradedVCPBacktestEngine:
                     # Intraday extreme circuit breaker (-10%)
                     if bar["low"] <= tr.entry_price * 0.90:
                         exit_triggered = True
-                        # Statutory exchange circuit filters cap single-day gap execution at -20% max
-                        # (prevents artificial execution on unadjusted corporate action / demerger ticks)
+                        # Stress mode (gap_loss_cap_pct=None): real open fills on gap-down, zero fabricated floors.
+                        # Capped behavior is only active when explicitly configured for stress comparison.
+
                         exit_price = min(tr.entry_price * 0.90, bar["open"])
                         if self.gap_loss_cap_pct is not None:
                             exit_price = max(tr.entry_price * (1.0 - self.gap_loss_cap_pct / 100.0), exit_price)
@@ -748,6 +836,20 @@ class UpgradedVCPBacktestEngine:
                         tr.exit_reason = f"CIRCUIT_DEFER: {exit_reason}"
                         exit_triggered = False
                     else:
+                        is_close_based = (
+                            "Closing" in exit_reason
+                            or "Dead Money" in exit_reason
+                            or "100 EMA Break" in exit_reason
+                            or "50 EMA Locked" in exit_reason
+                            or "QUARANTINE_TIMEOUT" in exit_reason
+                        )
+                        if self.exit_execution_mode == "NEXT_OPEN" and (is_close_based or not self.assumed_gtt_stops):
+                            pending_exits[sym] = (exit_reason, stage_name)
+                            tr.pending_exit = True
+                            tr.exit_reason = f"PENDING EXIT: {exit_reason}"
+                            exit_triggered = False
+                            continue
+
                         sell_friction = exit_price * tr.shares * self.cost_per_side
                         net_proceeds = (exit_price * tr.shares) - sell_friction
                         total_friction_paid += sell_friction
@@ -862,9 +964,11 @@ class UpgradedVCPBacktestEngine:
             tr.net_return_pct = (tr.exit_price_net / tr.entry_price_with_friction - 1.0) * 100.0
             tr.pnl_amount = (exit_p * tr.shares * (1.0 - self.cost_per_side)) - tr.invested_capital
             tr.calendar_days = (terminal_date - tr.entry_date).days
-            tr.exit_reason = "ACTIVE WEALTH COMPOUNDER (Holding Today)"
-            tr.stage_at_exit = "Active Holding"
-            tr.status = "Active"
+            tr.exit_reason = tr.exit_reason if getattr(tr, "pending_exit", False) else "ACTIVE WEALTH COMPOUNDER (Holding Today)"
+            tr.stage_at_exit = tr.stage_at_exit if getattr(tr, "pending_exit", False) else "Active Holding"
+            tr.status = "Closed" if getattr(tr, "pending_exit", False) else "Active"
+
+
             closed_trades.append(tr)
 
         # 5. Generate Performance DataFrames & Statistics

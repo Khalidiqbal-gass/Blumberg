@@ -171,3 +171,112 @@ def test_stale_bar_does_not_trigger_exit(temp_portfolio):
     )
     assert "BBB" in temp_portfolio.state.active_positions
     assert not any("SELL: BBB" in a for a in res["actions_taken"])
+
+
+
+def test_close_based_exit_queues_for_next_open_execution(temp_portfolio):
+    """Verify close-based stop signals queue at EOD and execute at next morning's open."""
+    # Day 1: Signal generated -> Day 2: Entered at open
+    fill = _enter(temp_portfolio)
+    assert temp_portfolio.get_summary()["active_positions_count"] == 1
+    cash_before_exit = temp_portfolio.state.cash
+
+    # Day 3: Stock closes below ATR closing stop (e.g. 935.0 <= 938.4), but low (925.0) does not breach -10% hard stop (918.0)
+    # EOD close signal must queue, NOT exit immediately today
+    b3 = _bar("2026-10-28", 950.0, 955.0, 925.0, 935.0)
+    res_d3 = temp_portfolio.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert temp_portfolio.get_summary()["active_positions_count"] == 1
+    assert len(temp_portfolio.state.closed_trades) == 0
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert temp_portfolio.state.pending_exits[0]["symbol"] == "DIXON"
+    assert "Closing Stop-Loss" in temp_portfolio.state.pending_exits[0]["exit_reason"]
+    # Cash must NOT be credited today (only daily cash yield accrued ~Rs 234, no trade proceeds)
+    assert abs(temp_portfolio.state.cash - cash_before_exit) < 500.0
+
+    # Day 4: Next session opens at 910.0 -> Exit must fill at open
+    b4 = _bar("2026-10-29", 910.0, 920.0, 905.0, 915.0)
+    res_d4 = temp_portfolio.execute_daily_rebalance(b4, BENCH, pd.DataFrame(), current_date_str="2026-10-29")
+
+    assert temp_portfolio.get_summary()["active_positions_count"] == 0
+    assert len(temp_portfolio.state.closed_trades) == 1
+    assert temp_portfolio.state.pending_exits == []
+    closed = temp_portfolio.state.closed_trades[0]
+    assert closed["exit_price"] == 910.0
+    assert closed["exit_date"] == "2026-10-29"
+    # Cash must now be credited
+    assert temp_portfolio.state.cash > cash_before_exit
+
+
+def test_pending_exit_lower_circuit_deferral(temp_portfolio):
+    """If stock opens locked limit-down on exit day, exit must defer to subsequent session."""
+    _enter(temp_portfolio)
+
+    # Queue close-based exit on Day 3
+    b3 = _bar("2026-10-28", 950.0, 955.0, 925.0, 935.0)
+    temp_portfolio.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+    assert len(temp_portfolio.state.pending_exits) == 1
+
+    # Day 4: Opens locked in lower circuit at 850.0 (prev close 915.0)
+    b4_locked = pd.DataFrame([{
+        "date": "2026-10-29", "symbol": "DIXON",
+        "open": 850.0, "high": 850.0, "low": 850.0, "close": 850.0, "volume": 1000,
+        "prev_close": 915.0,
+    }])
+    temp_portfolio.execute_daily_rebalance(b4_locked, BENCH, pd.DataFrame(), current_date_str="2026-10-29")
+
+    # Must defer: still active, still in pending_exits
+    assert temp_portfolio.get_summary()["active_positions_count"] == 1
+    assert len(temp_portfolio.state.closed_trades) == 0
+    assert len(temp_portfolio.state.pending_exits) == 1
+
+    # Day 5: Opens normally at 840.0 -> Fills at open
+    b5_normal = _bar("2026-10-30", 840.0, 850.0, 835.0, 845.0)
+    temp_portfolio.execute_daily_rebalance(b5_normal, BENCH, pd.DataFrame(), current_date_str="2026-10-30")
+
+    assert temp_portfolio.get_summary()["active_positions_count"] == 0
+    assert len(temp_portfolio.state.closed_trades) == 1
+    assert temp_portfolio.state.closed_trades[0]["exit_price"] == 840.0
+
+
+def test_rebalance_rerun_idempotency(temp_portfolio):
+    """Running execute_daily_rebalance twice for the same date must be idempotent."""
+    _enter(temp_portfolio)
+
+    # Day 3 first run: queue exit
+    b3 = _bar("2026-10-28", 930.0, 935.0, 910.0, 915.0)
+    temp_portfolio.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+    cash_run1 = temp_portfolio.state.cash
+    n_pending1 = len(temp_portfolio.state.pending_exits)
+
+    # Day 3 second run (same day rerun):
+    temp_portfolio.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+    assert temp_portfolio.state.cash == cash_run1
+    assert len(temp_portfolio.state.pending_exits) == n_pending1
+
+
+def test_intraday_stop_without_gtt_queues_for_next_open(tmp_path):
+    """When assumed_gtt_stops=False, even intraday stops queue to next open instead of same-day close."""
+    mgr = LivePortfolioManager(state_path=tmp_path / "nogtt.json", initial_capital=1_000_000.0, assumed_gtt_stops=False)
+    _enter(mgr)
+
+    # Day 3: Hard stop hit intraday (low = 890.0)
+    b3 = _bar("2026-10-28", 920.0, 930.0, 890.0, 895.0)
+    mgr.execute_daily_rebalance(b3, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    # Without GTT, it cannot fill today: queued to next open
+    assert mgr.get_summary()["active_positions_count"] == 1
+    assert len(mgr.state.pending_exits) == 1
+    assert "Circuit Breaker" in mgr.state.pending_exits[0]["exit_reason"]
+
+
+def test_quarantined_candidate_blocked_from_entry(temp_portfolio):
+    """Candidates flagged with corporate anomaly must be blocked from entering."""
+    cand = pd.DataFrame([
+        {"symbol": "ANOMALY", "close": 100.0, "is_corporate_anomaly": True, "sector": "Steel"}
+    ])
+    b = _bar("2026-10-26", 100.0, 102.0, 98.0, 100.0, sym="ANOMALY")
+    res = temp_portfolio.execute_daily_rebalance(b, BENCH, cand, current_date_str="2026-10-26")
+
+    assert temp_portfolio.state.pending_entries == []
+    assert any("CANDIDATE BLOCKED" in a and "ANOMALY" in a for a in res["actions_taken"])
