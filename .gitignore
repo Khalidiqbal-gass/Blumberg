@@ -29,3 +29,5 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+# Live paper-trading state changes on every daily run; keep it out of git.
+/data/live_portfolio_state.json
