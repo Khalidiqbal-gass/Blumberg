@@ -305,6 +305,23 @@ class LivePortfolioManager:
                 return None
             return b_
 
+        def _is_corporate_action_anomaly(bar_, position: dict) -> bool:
+            tag = bar_.get("is_corporate_anomaly", False)
+            tagged = pd.notna(tag) and bool(tag)
+            entry = float(position.get("entry_price", 0.0))
+            peak = float(position.get("peak_price", entry))
+            previous_price = position.get("current_price")
+            return bool(
+                position.get("is_quarantined", False)
+                or tagged
+                or (entry > 0 and float(bar_["low"]) <= entry * 0.65 and peak >= entry * 0.95)
+                or (
+                    previous_price is not None
+                    and float(previous_price) > 0
+                    and (float(bar_["low"]) / float(previous_price) - 1.0) <= -0.35
+                )
+            )
+
         # Step 0: Fill orders queued yesterday at TODAY'S OPEN (identical to backtest: signal at close D, fill at open D+1).
         # Cash/slots are those available before today's exits (T+1 settlement), exactly like the engine.
         fills_today: set[str] = set()
@@ -322,6 +339,11 @@ class LivePortfolioManager:
                         pe["attempt_count"] = pe.get("attempt_count", 0) + 1
                         remaining_pending_exits.append(pe)
                         actions_taken.append(f"⚠️ PENDING EXIT HELD: {psym} had no session bar today. Retrying next session.")
+                        continue
+
+                    if _is_corporate_action_anomaly(b, pos):
+                        pos["is_quarantined"] = True
+                        pos["current_stage"] = "Corporate Action Quarantine"
                         continue
 
                     open_p = float(b["open"])
@@ -480,102 +502,96 @@ class LivePortfolioManager:
             ema100_v = float(bar["ema100"]) if "ema100" in bar and pd.notna(bar["ema100"]) else None
             is_climax = bool(pos.get("is_climax_reached", False))
 
-            # Tranche 2 eligibility (decided at today's close, filled at tomorrow's open) - same rule as the engine
-            if (not pos.get("tranche2_active", False)) and pos.get("bars_held", 0) >= (self.tranche2_days - 1):
-                if close_p > entry_p and low_p > entry_p * 0.92:
-                    pos["tranche2_eligible"] = True
+            is_corp_action_anomaly = _is_corporate_action_anomaly(bar, pos)
 
-            # Exit ladder mirrors UpgradedVCPBacktestEngine one-for-one (same triggers, same fills).
-            # ---------------- STAGE 5: CLIMAX (needs climax flag AND prior peak >= +100%) ----------------
-            if is_climax and gain_from_entry >= 100.0:
-                stage_name = "Stage 5: Climax Harvesting"
-                pos["profit_floor_price"] = prior_peak * 0.75
-                if dip_from_peak <= -25.0:
-                    exit_triggered = True
-                    exit_price = min(prior_peak * 0.75, open_p)
-                    exit_reason = f"Parabolic Climax Exit (-25% Trail from Peak ₹{prior_peak:.2f})"
-
-            # ---------------- STAGE 4: SECULAR COMPOUNDER (peak >= +50%) ----------------
-            elif gain_from_entry >= 50.0:
-                stage_name = "Stage 4: Secular Compounding"
-                floor_4 = entry_p * 1.25
-                pos["profit_floor_price"] = floor_4
-                if low_p <= floor_4:
-                    exit_triggered = True
-                    exit_price = min(floor_4, open_p)
-                    exit_reason = "Secular Profit Floor (+25% Floor Protected)"
-                elif ema100_v is not None and close_p < ema100_v and dip_from_peak <= -20.0:
-                    exit_triggered = True
-                    exit_price = close_p
-                    exit_reason = "Secular Trend Ended (100 EMA Break & -20% Drop)"
-
-            # ---------------- STAGE 3: PROGRESSIVE RATCHET (+30% <= peak < +50%) ----------------
-            elif 30.0 <= gain_from_entry < 50.0:
-                stage_name = "Stage 3: Trend Momentum"
-                floor_12 = entry_p * 1.12
-                floor_px = max(floor_12, ema50_v) if ema50_v is not None else floor_12
-                pos["profit_floor_price"] = floor_12
-                if low_p <= floor_12:
-                    exit_triggered = True
-                    exit_price = min(floor_12, open_p)
-                    exit_reason = "Ratchet Profit Floor (+12% Locked)"
-                elif close_p < floor_px:
-                    exit_triggered = True
-                    exit_price = min(floor_px, open_p) if open_p < floor_px else close_p
-                    exit_reason = "Ratchet Profit Floor (+12% / 50 EMA Locked)"
-
-            # ---------------- STAGE 2: CAPITAL PRESERVATION (+15% <= peak < +30%) ----------------
-            elif 15.0 <= gain_from_entry < 30.0:
-                stage_name = "Stage 2: Capital Preservation"
-                be_floor = entry_p * 1.02
-                pos["profit_floor_price"] = be_floor
-                if low_p <= be_floor:
-                    exit_triggered = True
-                    exit_price = min(be_floor, open_p)
-                    exit_reason = "Breakeven Floor (+2% Profit Locked)"
-
-            # ---------------- STAGE 1: IGNITION DEFENSE (peak < +15%) ----------------
-            else:
-                stage_name = "Stage 1: Ignition Defense"
-                hard_stop = entry_p * 0.90
-                atr_val = float(bar["atr_14"]) if ("atr_14" in bar and pd.notna(bar["atr_14"])) else close_p * 0.03
-                closing_stop = max(entry_p * 0.92, entry_p - 2.5 * atr_val)
-                pos["stop_loss_price"] = closing_stop
-
-                # Demerger / Corporate Action anomaly check (LIVE-ONLY safety): a >35% single-day drop on an
-                # unadjusted corporate action (e.g. VEDL demerger) must not trigger a blind panic exit.
-                is_corp_action_anomaly = (
-                    ("is_corporate_anomaly" in bar and bool(bar["is_corporate_anomaly"]))
-                    or (low_p <= entry_p * 0.65 and prior_peak >= entry_p * 0.95)
-                    or (prev_recorded_price is not None and float(prev_recorded_price) > 0 and (low_p / float(prev_recorded_price) - 1.0) <= -0.35)
+            if is_corp_action_anomaly:
+                pos["is_quarantined"] = True
+                stage_name = "Corporate Action Quarantine"
+                if not is_same_day_rerun:
+                    pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
+                logger.warning(
+                    f"Potential unadjusted corporate action / demerger anomaly in {sym}. "
+                    "Quarantining position; automated liquidation halted."
                 )
+                actions_taken.append(
+                    f"QUARANTINE / ALERT: {sym} may have an unadjusted corporate action. "
+                    "Automated exits and additions are halted pending manual adjustment."
+                )
+            else:
+                # Tranche 2 eligibility (decided at today's close, filled at tomorrow's open).
+                if (not pos.get("tranche2_active", False)) and pos.get("bars_held", 0) >= (self.tranche2_days - 1):
+                    if close_p > entry_p and low_p > entry_p * 0.92:
+                        pos["tranche2_eligible"] = True
 
-                if is_corp_action_anomaly:
-                    pos["is_quarantined"] = True
-                    stage_name = "Corporate Action Quarantine"
-                    pos["current_stage"] = "QUARANTINE_MANUAL_REVIEW"
-                    if not is_same_day_rerun:
-                        pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
-                    logger.warning(
-                        f"⚠️ Potential unadjusted corporate action / demerger anomaly in {sym}. "
-                        "Quarantining position; automated liquidation halted."
-                    )
-                    actions_taken.append(
-                        f"⚠️ QUARANTINE / ALERT: {sym} dropped >35% (Possible Corporate Action/Demerger). "
-                        "Automated market sell halted; requires manual corporate action adjustment."
-                    )
-                elif low_p <= hard_stop:
-                    exit_triggered = True
-                    exit_price = min(hard_stop, open_p)
-                    exit_reason = "Extreme Circuit Breaker (-10% Hard Stop)"
-                elif close_p <= closing_stop:
-                    exit_triggered = True
-                    exit_price = min(closing_stop, open_p) if open_p < closing_stop else close_p
-                    exit_reason = "Closing Stop-Loss (ATR / -8% Threshold)"
-                elif pos["bars_held"] >= 30 and gain_from_entry < 10.0 and (ema20_v is None or close_p < ema20_v):
-                    exit_triggered = True
-                    exit_price = close_p
-                    exit_reason = "Dead Money Time-Stop Exit (30d Stagnant Base & Below 20 EMA)"
+                # Exit ladder mirrors UpgradedVCPBacktestEngine one-for-one (same triggers, same fills).
+                # ---------------- STAGE 5: CLIMAX (needs climax flag AND prior peak >= +100%) ----------------
+                if is_climax and gain_from_entry >= 100.0:
+                    stage_name = "Stage 5: Climax Harvesting"
+                    pos["profit_floor_price"] = prior_peak * 0.75
+                    if dip_from_peak <= -25.0:
+                        exit_triggered = True
+                        exit_price = min(prior_peak * 0.75, open_p)
+                        exit_reason = f"Parabolic Climax Exit (-25% Trail from Peak ₹{prior_peak:.2f})"
+
+                # ---------------- STAGE 4: SECULAR COMPOUNDER (peak >= +50%) ----------------
+                elif gain_from_entry >= 50.0:
+                    stage_name = "Stage 4: Secular Compounding"
+                    floor_4 = entry_p * 1.25
+                    pos["profit_floor_price"] = floor_4
+                    if low_p <= floor_4:
+                        exit_triggered = True
+                        exit_price = min(floor_4, open_p)
+                        exit_reason = "Secular Profit Floor (+25% Floor Protected)"
+                    elif ema100_v is not None and close_p < ema100_v and dip_from_peak <= -20.0:
+                        exit_triggered = True
+                        exit_price = close_p
+                        exit_reason = "Secular Trend Ended (100 EMA Break & -20% Drop)"
+
+                # ---------------- STAGE 3: PROGRESSIVE RATCHET (+30% <= peak < +50%) ----------------
+                elif 30.0 <= gain_from_entry < 50.0:
+                    stage_name = "Stage 3: Trend Momentum"
+                    floor_12 = entry_p * 1.12
+                    floor_px = max(floor_12, ema50_v) if ema50_v is not None else floor_12
+                    pos["profit_floor_price"] = floor_12
+                    if low_p <= floor_12:
+                        exit_triggered = True
+                        exit_price = min(floor_12, open_p)
+                        exit_reason = "Ratchet Profit Floor (+12% Locked)"
+                    elif close_p < floor_px:
+                        exit_triggered = True
+                        exit_price = min(floor_px, open_p) if open_p < floor_px else close_p
+                        exit_reason = "Ratchet Profit Floor (+12% / 50 EMA Locked)"
+
+                # ---------------- STAGE 2: CAPITAL PRESERVATION (+15% <= peak < +30%) ----------------
+                elif 15.0 <= gain_from_entry < 30.0:
+                    stage_name = "Stage 2: Capital Preservation"
+                    be_floor = entry_p * 1.02
+                    pos["profit_floor_price"] = be_floor
+                    if low_p <= be_floor:
+                        exit_triggered = True
+                        exit_price = min(be_floor, open_p)
+                        exit_reason = "Breakeven Floor (+2% Profit Locked)"
+
+                # ---------------- STAGE 1: IGNITION DEFENSE (peak < +15%) ----------------
+                else:
+                    stage_name = "Stage 1: Ignition Defense"
+                    hard_stop = entry_p * 0.90
+                    atr_val = float(bar["atr_14"]) if ("atr_14" in bar and pd.notna(bar["atr_14"])) else close_p * 0.03
+                    closing_stop = max(entry_p * 0.92, entry_p - 2.5 * atr_val)
+                    pos["stop_loss_price"] = closing_stop
+
+                    if low_p <= hard_stop:
+                        exit_triggered = True
+                        exit_price = min(hard_stop, open_p)
+                        exit_reason = "Extreme Circuit Breaker (-10% Hard Stop)"
+                    elif close_p <= closing_stop:
+                        exit_triggered = True
+                        exit_price = min(closing_stop, open_p) if open_p < closing_stop else close_p
+                        exit_reason = "Closing Stop-Loss (ATR / -8% Threshold)"
+                    elif pos["bars_held"] >= 30 and gain_from_entry < 10.0 and (ema20_v is None or close_p < ema20_v):
+                        exit_triggered = True
+                        exit_price = close_p
+                        exit_reason = "Dead Money Time-Stop Exit (30d Stagnant Base & Below 20 EMA)"
 
             prev_recorded_price = pos.get("current_price")
             pos["current_stage"] = stage_name

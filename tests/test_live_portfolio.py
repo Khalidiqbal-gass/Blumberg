@@ -357,3 +357,67 @@ def test_corporate_action_quarantine_manual_review_in_live(temp_portfolio):
     assert len(temp_portfolio.state.pending_exits) == 0
     assert len(temp_portfolio.state.closed_trades) == 0
     assert any("QUARANTINE" in a for a in res["actions_taken"])
+
+
+@pytest.mark.parametrize(
+    ("peak_multiple", "is_climax"),
+    [(1.22, False), (1.40, False), (1.60, False), (2.20, True)],
+    ids=["stage-2", "stage-3", "stage-4", "stage-5"],
+)
+def test_corporate_action_quarantine_blocks_all_exit_stages(
+    temp_portfolio, peak_multiple, is_climax
+):
+    """Corporate-action tags must quarantine holdings before any stage exit logic runs."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["peak_price"] = pos["entry_price"] * peak_multiple
+    pos["is_climax_reached"] = is_climax
+
+    anomaly = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 550.0, "high": 560.0, "low": 540.0, "close": 550.0,
+        "volume": 50_000, "prev_close": 1000.0, "is_corporate_anomaly": True,
+    }])
+    temp_portfolio.execute_daily_rebalance(
+        anomaly, BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+
+    assert pos["is_quarantined"] is True
+    assert pos["current_stage"] == "Corporate Action Quarantine"
+    assert temp_portfolio.state.pending_exits == []
+    assert temp_portfolio.state.closed_trades == []
+
+    # Quarantine persists through a rebound until a human applies the official adjustment.
+    rebound = _bar("2026-10-29", 800.0, 850.0, 780.0, 810.0)
+    temp_portfolio.execute_daily_rebalance(
+        rebound, BENCH, pd.DataFrame(), current_date_str="2026-10-29"
+    )
+    assert pos["is_quarantined"] is True
+    assert pos["current_stage"] == "Corporate Action Quarantine"
+    assert temp_portfolio.state.pending_exits == []
+    assert temp_portfolio.state.closed_trades == []
+
+
+def test_corporate_action_on_pending_exit_fill_day_cancels_automatic_fill(temp_portfolio):
+    """A newly detected corporate action must quarantine before a queued open exit is filled."""
+    _enter(temp_portfolio)
+    stop_signal = _bar("2026-10-28", 950.0, 955.0, 925.0, 935.0)
+    temp_portfolio.execute_daily_rebalance(
+        stop_signal, BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+    assert len(temp_portfolio.state.pending_exits) == 1
+
+    anomaly = pd.DataFrame([{
+        "date": "2026-10-29", "symbol": "DIXON",
+        "open": 550.0, "high": 560.0, "low": 540.0, "close": 550.0,
+        "volume": 50_000, "prev_close": 935.0, "is_corporate_anomaly": True,
+    }])
+    temp_portfolio.execute_daily_rebalance(
+        anomaly, BENCH, pd.DataFrame(), current_date_str="2026-10-29"
+    )
+
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    assert pos["is_quarantined"] is True
+    assert pos["current_stage"] == "Corporate Action Quarantine"
+    assert temp_portfolio.state.pending_exits == []
+    assert temp_portfolio.state.closed_trades == []
