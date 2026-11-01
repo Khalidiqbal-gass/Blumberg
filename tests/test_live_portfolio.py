@@ -23,7 +23,9 @@ def _bar(date, o, h, l, c, sym="DIXON", v=100000):
     return pd.DataFrame([{"date": date, "symbol": sym, "open": o, "high": h, "low": l, "close": c, "volume": v}])
 
 
-BENCH = pd.DataFrame([{"date": "2026-10-26", "close": 25000.0, "volume": 1000000}])
+# Live runner feeds ~2 years of benchmark history; EMA200 needs >= 200 bars (rising trend => regime ON)
+_BENCH_DATES = pd.bdate_range(end="2026-10-26", periods=250)
+BENCH = pd.DataFrame({"date": _BENCH_DATES, "close": np.linspace(20000.0, 25000.0, 250), "volume": 1000000})
 CAND = pd.DataFrame([{"symbol": "DIXON", "close": 1000.0, "radar_score": 85.0,
                       "sector": "EMS / Electronics", "primary_driver": "VCP Squeeze"}])
 

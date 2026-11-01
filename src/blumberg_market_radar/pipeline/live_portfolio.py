@@ -235,10 +235,14 @@ class LivePortfolioManager:
         regime_ok = True
         if enforce_regime and bench_df is not None and not bench_df.empty and "date" in bench_df.columns and "close" in bench_df.columns:
             bench_sorted = bench_df.sort_values("date").reset_index(drop=True)
-            if len(bench_sorted) >= 50:
+            # Fewer than 200 benchmark bars means the EMA200 is not meaningful: block new entries
+            # rather than silently substituting EMA50 (which would weaken the filter).
+            if len(bench_sorted) < 200:
+                regime_ok = False
+            else:
                 bench_close = bench_sorted["close"].iloc[-1]
                 bench_ema50 = bench_sorted["close"].ewm(span=50, adjust=False).mean().iloc[-1]
-                bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1] if len(bench_sorted) >= 200 else bench_ema50
+                bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1]
                 if self.regime_mode == "AND":
                     regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200))
                 elif self.regime_mode == "AND_TREND":
