@@ -113,7 +113,7 @@ class UpgradedVCPBacktestEngine:
         cash_yield_pct_p_a: float = 6.5,  # Annualized 6.5% liquid fund/T-Bill yield on uninvested cash
         entry_anchor_mode: str = "BLENDED_RAW",  # "BLENDED_RAW" (current standard) or "T1_INITIAL" (legacy ablation)
         t1_blend_mode: str = "RAW_FILL",        # "RAW_FILL" (current standard) or "INVESTED_OVER_SHARES" (legacy ablation)
-        gap_loss_cap_pct: float | None = 20.0,  # Hard-stop gap fill floor (-20%). None = fill at the real open (stress mode)
+        gap_loss_cap_pct: float | None = None,  # Default None (Stress mode: real open fills on gap-down, zero fabricated floors)
         stage5_fill_mode: str = "FLOOR",        # "FLOOR" = fill at -25% trail (optimistic); "CLOSE" = fill at the close that triggered it (realistic)
         stale_exit_sessions: int | None = 20,  # Force-exit a position whose data stops (delisting/suspension) after N missing sessions
         dd_brake_pct: float | None = None,   # experimental: pause NEW entries while equity is this % below its peak

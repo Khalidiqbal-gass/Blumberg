@@ -190,8 +190,8 @@ def test_stale_data_position_is_force_closed_not_carried_at_entry_price():
 
 def test_gap_cap_is_configurable():
     from blumberg_market_radar.backtest.upgraded_vcp_engine import UpgradedVCPBacktestEngine
-    assert UpgradedVCPBacktestEngine().gap_loss_cap_pct == 20.0
-    assert UpgradedVCPBacktestEngine(gap_loss_cap_pct=None).gap_loss_cap_pct is None
+    assert UpgradedVCPBacktestEngine().gap_loss_cap_pct is None
+    assert UpgradedVCPBacktestEngine(gap_loss_cap_pct=20.0).gap_loss_cap_pct == 20.0
     assert UpgradedVCPBacktestEngine(stage5_fill_mode="close").stage5_fill_mode == "CLOSE"
 
 
