@@ -90,6 +90,7 @@ class LivePortfolioState:
     created_at: str = ""
     pending_entries: list[dict] = field(default_factory=list)  # signals to be filled at the NEXT session open
     pending_exits: list[dict] = field(default_factory=list)  # exit orders queued at EOD to fill at NEXT session open
+    corporate_action_entitlements: list[dict] = field(default_factory=list)  # unlisted/pending spin-offs from demergers
 
 
 class LivePortfolioManager:
@@ -144,6 +145,7 @@ class LivePortfolioManager:
                     created_at=data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                     pending_entries=data.get("pending_entries", []),
                     pending_exits=data.get("pending_exits", []),
+                    corporate_action_entitlements=data.get("corporate_action_entitlements", []),
                 )
             except Exception as exc:
                 bak_path = self.state_path.with_name(
@@ -168,6 +170,7 @@ class LivePortfolioManager:
             daily_equity_history=[],
             last_rebalance_date="",
             created_at=today_str,
+            corporate_action_entitlements=[],
         )
         self.save_state(fresh)
         return fresh
@@ -239,6 +242,7 @@ class LivePortfolioManager:
         old_shares = float(pos["shares"])
         old_entry_price = float(pos["entry_price"])
         old_invested_cap = float(pos["invested_capital"])
+        old_current_price = float(pos.get("current_price", old_entry_price))
 
         # 1. Scale shares up by split_ratio
         new_shares = old_shares * split_ratio
@@ -270,7 +274,19 @@ class LivePortfolioManager:
         if "current_price" in pos and pos["current_price"]:
             pos["current_price"] = float(pos["current_price"]) * price_adj_multiplier
 
-        # 5. Invested capital scales by cost_basis_factor
+        # 5. Invested capital scales by cost_basis_factor; for demergers, track carved-out spin-off entitlement
+        if cost_basis_factor < 1.0:
+            carved_out_cap = old_invested_cap * (1.0 - cost_basis_factor)
+            carved_out_mtm = (old_shares * old_current_price) * (1.0 - cost_basis_factor)
+            self.state.corporate_action_entitlements.append({
+                "parent_symbol": sym,
+                "entitlement_type": "SPIN_OFF",
+                "allocated_capital": carved_out_cap,
+                "market_value": carved_out_mtm,
+                "created_date": datetime.now().strftime("%Y-%m-%d"),
+                "status": "Awaiting Listing / Credit",
+                "description": f"Spin-off entitlement from {sym} demerger ({(1.0 - cost_basis_factor)*100:.1f}% cost basis)",
+            })
         new_invested_cap = old_invested_cap * cost_basis_factor
         pos["invested_capital"] = new_invested_cap
 
@@ -307,6 +323,25 @@ class LivePortfolioManager:
             "is_quarantined": False,
         }
 
+    def settle_corporate_action_entitlement(
+        self,
+        parent_symbol: str,
+        realized_cash: float | None = None,
+    ) -> dict:
+        """Settle a pending corporate action entitlement when spin-off shares are credited/liquidated."""
+        sym = str(parent_symbol).upper().replace(".NS", "").replace(".BO", "").strip()
+        matched = [e for e in self.state.corporate_action_entitlements if e.get("parent_symbol") == sym and e.get("status") != "Settled"]
+        if not matched:
+            raise KeyError(f"No active corporate action entitlement found for {sym!r}")
+        ent = matched[0]
+        ent["status"] = "Settled"
+        ent["settled_date"] = datetime.now().strftime("%Y-%m-%d")
+        cash_added = float(realized_cash) if realized_cash is not None else float(ent.get("allocated_capital", 0.0))
+        ent["realized_cash"] = cash_added
+        self.state.cash += cash_added
+        self.save_state()
+        return ent
+
     def get_summary(self, latest_prices: dict[str, float] | None = None) -> dict:
         """Compute live portfolio metrics."""
         prices = latest_prices or {}
@@ -317,10 +352,25 @@ class LivePortfolioManager:
             shares = pos_dict.get("shares", 0.0)
             mtm_positions += shares * curr_p
 
-        total_equity = self.state.cash + mtm_positions
-        invested = sum(p.get("invested_capital", 0.0) for p in self.state.active_positions.values())
-        unrealized_pnl = mtm_positions - invested
-        realized_pnl = sum(c.get("net_pnl_rs", 0.0) for c in self.state.closed_trades)
+        entitlements_mtm = sum(
+            float(e.get("market_value", e.get("allocated_capital", 0.0)))
+            for e in self.state.corporate_action_entitlements
+            if e.get("status") != "Settled"
+        )
+        entitlements_cost = sum(
+            float(e.get("allocated_capital", 0.0))
+            for e in self.state.corporate_action_entitlements
+            if e.get("status") != "Settled"
+        )
+        settled_entitlement_pnl = sum(
+            float(e.get("realized_cash", 0.0)) - float(e.get("allocated_capital", 0.0))
+            for e in self.state.corporate_action_entitlements
+            if e.get("status") == "Settled"
+        )
+        total_equity = self.state.cash + mtm_positions + entitlements_mtm
+        invested = sum(p.get("invested_capital", 0.0) for p in self.state.active_positions.values()) + entitlements_cost
+        unrealized_pnl = (mtm_positions + entitlements_mtm) - invested
+        realized_pnl = sum(c.get("net_pnl_rs", 0.0) for c in self.state.closed_trades) + settled_entitlement_pnl
         total_pnl = total_equity - self.state.initial_capital
         total_return_pct = (total_equity / self.state.initial_capital - 1.0) * 100.0 if self.state.initial_capital > 0 else 0.0
 
@@ -334,6 +384,7 @@ class LivePortfolioManager:
             "cash": self.state.cash,
             "invested_capital": invested,
             "market_value_holdings": mtm_positions,
+            "corporate_action_entitlements_val": entitlements_mtm,
             "unrealized_pnl_rs": unrealized_pnl,
             "unrealized_pnl_pct": (unrealized_pnl / invested * 100.0) if invested > 0 else 0.0,
             "realized_pnl_rs": realized_pnl,
@@ -363,29 +414,45 @@ class LivePortfolioManager:
         actions_taken = []
         is_same_day_rerun = (self.state.last_rebalance_date == today_date)
 
-        # 1. Benchmark Regime Check (Strictly fail-closed when data is missing or incomplete)
+        # 1. Benchmark Regime Check (Strictly fail-closed, strictly causal, no lookahead, no stale data)
         regime_ok = True
         if enforce_regime:
             if bench_df is None or bench_df.empty or "date" not in bench_df.columns or "close" not in bench_df.columns:
                 regime_ok = False
                 logger.warning("Benchmark data missing or invalid: regime set to fail-closed (regime_ok=False)")
             else:
-                bench_sorted = bench_df.sort_values("date").reset_index(drop=True)
-                # Fewer than 200 benchmark bars means the EMA200 is not meaningful: block new entries
-                # rather than silently substituting EMA50 (which would weaken the filter).
-                if len(bench_sorted) < 200:
+                # 1. Strictly causal: filter benchmark bars up to today_date (prevents lookahead from future benchmark data)
+                bench_proc = bench_df.copy()
+                bench_proc["_date_str"] = pd.to_datetime(bench_proc["date"]).dt.strftime("%Y-%m-%d")
+                bench_causal = bench_proc[bench_proc["_date_str"] <= today_date].sort_values("date").reset_index(drop=True)
+
+                if len(bench_causal) < 200:
                     regime_ok = False
-                    logger.warning(f"Benchmark has only {len(bench_sorted)} bars (<200): regime set to fail-closed (regime_ok=False)")
+                    logger.warning(
+                        f"Benchmark has only {len(bench_causal)} causal bars up to {today_date} (<200): "
+                        "regime set to fail-closed (regime_ok=False)"
+                    )
                 else:
-                    bench_close = bench_sorted["close"].iloc[-1]
-                    bench_ema50 = bench_sorted["close"].ewm(span=50, adjust=False).mean().iloc[-1]
-                    bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1]
-                    if self.regime_mode == "AND":
-                        regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200))
-                    elif self.regime_mode == "AND_TREND":
-                        regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200) and (bench_ema50 > bench_ema200))
+                    # 2. Staleness check: benchmark must not be disconnected/stale (>7 calendar days gap)
+                    latest_bench_dt = pd.to_datetime(bench_causal["date"].iloc[-1]).tz_localize(None) if pd.to_datetime(bench_causal["date"].iloc[-1]).tzinfo else pd.to_datetime(bench_causal["date"].iloc[-1])
+                    curr_dt = pd.to_datetime(today_date)
+                    gap_days = (curr_dt - latest_bench_dt).days
+                    if gap_days > 7:
+                        regime_ok = False
+                        logger.warning(
+                            f"Benchmark data is stale ({gap_days} calendar days old, latest bar: {latest_bench_dt.strftime('%Y-%m-%d')}): "
+                            "regime set to fail-closed (regime_ok=False)"
+                        )
                     else:
-                        regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
+                        bench_close = float(bench_causal["close"].iloc[-1])
+                        bench_ema50 = float(bench_causal["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+                        bench_ema200 = float(bench_causal["close"].ewm(span=200, adjust=False).mean().iloc[-1])
+                        if self.regime_mode == "AND":
+                            regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200))
+                        elif self.regime_mode == "AND_TREND":
+                            regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200) and (bench_ema50 > bench_ema200))
+                        else:
+                            regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
 
         # Accrue daily cash yield (Only once per calendar day)
         if not is_same_day_rerun:
@@ -454,7 +521,11 @@ class LivePortfolioManager:
             )
 
         # Step 0: Fill orders queued yesterday at TODAY'S OPEN (identical to backtest: signal at close D, fill at open D+1).
-        # Cash/slots are those available before today's exits (T+1 settlement), exactly like the engine.
+        # Rule: Entries & Tranches at morning open can ONLY use cash & slots available from yesterday's close.
+        # Exit proceeds from today's trades are NOT available immediately (T+1 settlement / prevents same-morning recycling).
+        cash_avail_at_open = float(self.state.cash)
+        slots_avail_at_open = max(0, self.max_slots - len(self.state.active_positions))
+
         fills_today: set[str] = set()
         if not is_same_day_rerun:
             # 00. Pending Exits queued at previous session's close fill at TODAY'S OPEN
@@ -488,7 +559,13 @@ class LivePortfolioManager:
                     high_p = float(b["high"])
                     close_p = float(b["close"])
                     prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else float(pos.get("current_price", open_p))
-                    is_lower_circuit = (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)
+                    
+                    # Lower circuit check at open:
+                    # An exit order cannot execute if stock is locked limit-down without liquidity.
+                    is_lower_circuit = (
+                        (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)
+                        or (open_p == low_p and prev_c is not None and open_p <= prev_c * 0.95 and (high_p == open_p or close_p <= open_p))
+                    )
 
                     if is_lower_circuit:
                         pe["attempt_count"] = pe.get("attempt_count", 0) + 1
@@ -500,7 +577,7 @@ class LivePortfolioManager:
                     shares = float(pos["shares"])
                     sell_friction = fill_price * shares * self.cost_per_side
                     net_proceeds = (fill_price * shares) - sell_friction
-                    self.state.cash += net_proceeds
+                    self.state.cash += net_proceeds  # Credited to cash ledger, but unavailable for same-morning rebuys
 
                     net_ret = (fill_price * (1.0 - self.cost_per_side) / pos["entry_price_with_friction"] - 1.0) * 100.0
                     net_pnl = net_proceeds - float(pos["invested_capital"])
@@ -537,12 +614,25 @@ class LivePortfolioManager:
                     b = _bar_today(sym)
                     if b is None or float(b["high"]) == float(b["low"]):  # no bar / upper-circuit lock
                         continue
+
+                    # FIX: Detect if today's open is an unadjusted corporate action gap-down!
+                    if _is_corporate_action_anomaly(b, pos):
+                        pos["is_quarantined"] = True
+                        pos["current_stage"] = "Corporate Action Quarantine"
+                        if not is_same_day_rerun:
+                            pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
+                        actions_taken.append(
+                            f"⚠️ TRANCHE 2 BLOCKED & QUARANTINED: {sym} opened with corporate action anomaly. Tranche 2 cancelled."
+                        )
+                        continue
+
                     raw_t2 = float(b["open"])
-                    t2_alloc = min(self.state.cash, pos["target_slot_capital"] * 0.5, _liq_cap(b))
+                    t2_alloc = min(cash_avail_at_open, pos["target_slot_capital"] * 0.5, _liq_cap(b))
                     if t2_alloc < 2500.0:
                         continue
                     t2_shares = (t2_alloc * (1.0 - self.cost_per_side)) / raw_t2
                     self.state.cash -= t2_alloc
+                    cash_avail_at_open -= t2_alloc
                     t1_shares = float(pos["shares"])
                     t1_price = float(pos.get("tranche1_price", pos["entry_price"]))
                     total_shares = t1_shares + t2_shares
@@ -556,19 +646,19 @@ class LivePortfolioManager:
                     pos["tranche2_price"] = raw_t2
                     actions_taken.append(f"🟢 TRANCHE 2 FILLED: {sym} +{t2_shares:.1f} shs @ open ₹{raw_t2:.2f} (Confirmed Winner)")
 
-            # 0b. Tranche 1 entries queued yesterday
+            # 0b. Tranche 1 entries queued yesterday (strictly uses cash and slots available before today's exits)
             queued = list(self.state.pending_entries)
             self.state.pending_entries = []
             if queued:
-                eq_open = self.state.cash + sum(
+                eq_open = cash_avail_at_open + sum(
                     float(p_["shares"]) * float(bars_latest.loc[s_]["open"]) if s_ in bars_latest.index else float(p_["invested_capital"])
                     for s_, p_ in self.state.active_positions.items()
                 )
                 slot_cap = eq_open / self.max_slots
-                free_slots = max(0, self.max_slots - len(self.state.active_positions))
+                free_slots = min(slots_avail_at_open, max(0, self.max_slots - len(self.state.active_positions)))
                 for q in queued:
                     qsym = q["symbol"]
-                    if free_slots <= 0 or self.state.cash < 2500.0:
+                    if free_slots <= 0 or cash_avail_at_open < 2500.0:
                         dropped = [x["symbol"] for x in queued[queued.index(q):] if x["symbol"] not in self.state.active_positions]
                         actions_taken.append(
                             f"⚠️ QUEUED ORDERS DROPPED (no free slot/cash): {', '.join(dropped)}"
@@ -587,11 +677,12 @@ class LivePortfolioManager:
                         actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at circuit, no entry")
                         continue
                     raw_entry = float(b["open"])
-                    t1_alloc = min(self.state.cash, slot_cap * 0.5, _liq_cap(b))
+                    t1_alloc = min(cash_avail_at_open, slot_cap * 0.5, _liq_cap(b))
                     if t1_alloc < 2500.0:
                         continue
                     t1_shares = (t1_alloc * (1.0 - self.cost_per_side)) / raw_entry
                     self.state.cash -= t1_alloc
+                    cash_avail_at_open -= t1_alloc
                     pos_obj = LiveTradePosition(
                         symbol=qsym, entry_date=today_date, shares=t1_shares, invested_capital=t1_alloc,
                         entry_price=raw_entry, entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
@@ -605,6 +696,7 @@ class LivePortfolioManager:
                     self.state.active_positions[qsym] = asdict(pos_obj)
                     fills_today.add(qsym)
                     free_slots -= 1
+                    slots_avail_at_open -= 1
                     actions_taken.append(f"🚀 ENTRY FILLED (Tranche 1): {qsym} {t1_shares:.1f} shs @ open ₹{raw_entry:.2f} (Invested: ₹{t1_alloc:,.0f})")
 
         # Step A: Evaluate Exits for Active Trades (positions opened this morning are not evaluated today, as in the engine)

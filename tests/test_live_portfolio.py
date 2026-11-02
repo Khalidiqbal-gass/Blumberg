@@ -24,8 +24,8 @@ def _bar(date, o, h, l, c, sym="DIXON", v=100000):
 
 
 # Live runner feeds ~2 years of benchmark history; EMA200 needs >= 200 bars (rising trend => regime ON)
-_BENCH_DATES = pd.bdate_range(end="2026-10-26", periods=250)
-BENCH = pd.DataFrame({"date": _BENCH_DATES, "close": np.linspace(20000.0, 25000.0, 250), "volume": 1000000})
+_BENCH_DATES = pd.bdate_range(end="2026-11-20", periods=300)
+BENCH = pd.DataFrame({"date": _BENCH_DATES, "close": np.linspace(20000.0, 25000.0, 300), "volume": 1000000})
 CAND = pd.DataFrame([{"symbol": "DIXON", "close": 1000.0, "radar_score": 85.0,
                       "sector": "EMS / Electronics", "primary_driver": "VCP Squeeze"}])
 
@@ -607,3 +607,155 @@ def test_benchmark_missing_or_short_fails_closed(temp_portfolio):
         _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), short_bench, CAND, current_date_str="2026-10-26"
     )
     assert res_short["regime_ok"] is False
+
+
+def test_tranche2_blocked_if_open_bar_is_corporate_anomaly(temp_portfolio):
+    """If stock opens with an unadjusted corporate action gap-down, Step 0a must block Tranche 2 and quarantine."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["tranche2_eligible"] = True
+
+    cash_before = temp_portfolio.state.cash
+    shares_before = pos["shares"]
+
+    # Day 8 open: stock opens with a massive -50% unadjusted demerger gap-down
+    anomaly_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 500.0, "high": 510.0, "low": 490.0, "close": 505.0,
+        "volume": 50000, "prev_close": 1025.0, "is_corporate_anomaly": True,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(
+        anomaly_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+
+    pos_after = temp_portfolio.state.active_positions["DIXON"]
+    assert pos_after["is_quarantined"] is True
+    assert pos_after["tranche2_active"] is False
+    assert pos_after["shares"] == shares_before
+    # Cash was NOT deducted for Tranche 2 (~Rs 62,500)
+    assert temp_portfolio.state.cash >= cash_before
+    assert any("TRANCHE 2 BLOCKED & QUARANTINED" in a for a in res["actions_taken"])
+
+
+def test_morning_exit_cash_and_slots_not_recycled_same_morning(temp_portfolio):
+    """Exit proceeds and freed slots from 9:15 AM cannot be recycled for new entries on the same morning (T+1 settlement)."""
+    _enter(temp_portfolio)
+    # Queue exit for DIXON
+    temp_portfolio.state.pending_exits.append({
+        "symbol": "DIXON",
+        "signal_date": "2026-10-27",
+        "exit_reason": "Closing Stop-Loss (ATR / -8% Threshold)",
+        "stage_at_signal": "Stage 1: Ignition Defense",
+        "signal_price": 930.0,
+        "shares": temp_portfolio.state.active_positions["DIXON"]["shares"],
+        "attempt_count": 0,
+    })
+    # Also simulate all 8 slots full by inserting dummy active positions
+    for i in range(1, 8):
+        temp_portfolio.state.active_positions[f"DUMMY{i}"] = {
+            "symbol": f"DUMMY{i}", "entry_date": "2026-10-26", "shares": 100.0,
+            "invested_capital": 100000.0, "entry_price": 1000.0, "entry_price_with_friction": 1010.0,
+            "current_price": 1000.0, "peak_price": 1000.0, "current_gain_pct": 0.0,
+            "peak_gain_pct": 0.0, "unrealized_pnl_rs": 0.0, "target_slot_capital": 125000.0,
+            "tranche1_shares": 100.0, "tranche1_price": 1000.0, "bars_held": 2,
+        }
+    # Exactly 8 active positions, so free slots at open = 0!
+    assert len(temp_portfolio.state.active_positions) == 8
+
+    # Queue a new entry candidate for morning open
+    temp_portfolio.state.pending_entries.append({
+        "symbol": "NEWSTOCK", "signal_date": "2026-10-27", "sector": "Auto", "selection_reason": "VCP"
+    })
+
+    # Morning open: DIXON exits, but NEWSTOCK must NOT fill because slots at open = 0
+    day_bars = pd.DataFrame([
+        {"date": "2026-10-28", "symbol": "DIXON", "open": 920.0, "high": 930.0, "low": 915.0, "close": 925.0, "volume": 100000},
+        {"date": "2026-10-28", "symbol": "NEWSTOCK", "open": 500.0, "high": 510.0, "low": 495.0, "close": 505.0, "volume": 100000},
+    ])
+    res = temp_portfolio.execute_daily_rebalance(day_bars, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert "DIXON" not in temp_portfolio.state.active_positions
+    assert "NEWSTOCK" not in temp_portfolio.state.active_positions
+    assert any("QUEUED ORDERS DROPPED" in a for a in res["actions_taken"])
+
+
+def test_demerger_resolution_creates_spin_off_entitlement_preserving_equity(temp_portfolio):
+    """Demerger with cost_basis_factor < 1.0 must track carved-out capital in spin-off entitlements."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["is_quarantined"] = True
+    pos["anomaly_days"] = 1
+
+    summary_before = temp_portfolio.get_summary()
+    equity_before = summary_before["total_equity"]
+    old_inv = float(pos["invested_capital"])
+
+    # Demerger resolution: parent retains 80% cost basis, 20% spin-off entitlement
+    res = temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80)
+    assert pos["invested_capital"] == pytest.approx(old_inv * 0.80)
+
+    # Entitlement must be recorded
+    assert len(temp_portfolio.state.corporate_action_entitlements) == 1
+    ent = temp_portfolio.state.corporate_action_entitlements[0]
+    assert ent["parent_symbol"] == "DIXON"
+    assert ent["allocated_capital"] == pytest.approx(old_inv * 0.20)
+    assert ent["status"] == "Awaiting Listing / Credit"
+
+    # Total portfolio equity must be conserved (entitlement value included)
+    summary_after = temp_portfolio.get_summary()
+    assert summary_after["total_equity"] == pytest.approx(equity_before)
+
+    # Settle entitlement when spin-off lists/credits cash
+    settled = temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=12500.0)
+    assert settled["status"] == "Settled"
+    assert settled["realized_cash"] == 12500.0
+
+
+def test_causal_benchmark_filters_future_and_rejects_stale(temp_portfolio):
+    """Benchmark regime check must strictly filter future bars (<= today_date) and reject stale feeds."""
+    # 1. Future bars in bench_df must not leak into decision
+    dates_with_future = pd.bdate_range("2025-01-01", periods=250)
+    future_bench = pd.DataFrame({"date": dates_with_future, "close": np.linspace(20000, 25000, 250)})
+    
+    # Evaluate at a past date (only 50 bars exist <= 2025-03-15)
+    res_future = temp_portfolio.execute_daily_rebalance(
+        _bar("2025-03-15", 1000.0, 1010.0, 990.0, 1000.0), future_bench, CAND, current_date_str="2025-03-15"
+    )
+    # Only 50 causal bars exist up to 2025-03-15, which is <200 -> fail closed!
+    assert res_future["regime_ok"] is False
+
+    # 2. Stale benchmark (>7 days old) must fail-closed
+    stale_dates = pd.bdate_range(end="2026-10-10", periods=250)
+    stale_bench = pd.DataFrame({"date": stale_dates, "close": np.linspace(20000, 25000, 250)})
+    res_stale = temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), stale_bench, CAND, current_date_str="2026-10-26"
+    )
+    # 2026-10-26 is 16 days after 2026-10-10 (> 7 calendar days) -> fail closed!
+    assert res_stale["regime_ok"] is False
+
+
+def test_open_at_floor_lower_circuit_defers_exit(temp_portfolio):
+    """If stock opens at floor (open == low <= prev_close * 0.95), exit must be deferred to prevent impossible fills."""
+    _enter(temp_portfolio)
+    temp_portfolio.state.pending_exits.append({
+        "symbol": "DIXON",
+        "signal_date": "2026-10-27",
+        "exit_reason": "Closing Stop-Loss (ATR / -8% Threshold)",
+        "stage_at_signal": "Stage 1: Ignition Defense",
+        "signal_price": 930.0,
+        "shares": temp_portfolio.state.active_positions["DIXON"]["shares"],
+        "attempt_count": 0,
+    })
+
+    # Opens locked at 5% lower circuit floor (open == low == 970 <= 1025 * 0.95)
+    floor_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 970.0, "high": 970.0, "low": 970.0, "close": 970.0,
+        "volume": 5000, "prev_close": 1025.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(floor_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert temp_portfolio.state.pending_exits[0]["attempt_count"] == 1
+    assert "DIXON" in temp_portfolio.state.active_positions
+    assert any("PENDING EXIT DEFERRED" in a for a in res["actions_taken"])
