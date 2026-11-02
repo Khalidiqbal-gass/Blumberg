@@ -86,6 +86,7 @@ def scan_engine_vcp_candidates(
             rvol = float(last_row["rvol"]) if pd.notna(last_row.get("rvol")) else 1.0
             atr_14 = float(last_row["atr_14"]) if pd.notna(last_row.get("atr_14")) else 0.0
             sector = str(last_row.get("sector", "Diversified"))
+            is_corp_anomaly = bool(last_row.get("is_corporate_anomaly", False))
             candidates.append({
                 "symbol": clean_sym,
                 "close": close_p,
@@ -93,6 +94,7 @@ def scan_engine_vcp_candidates(
                 "rvol": rvol,
                 "atr_14": atr_14,
                 "sector": sector,
+                "is_corporate_anomaly": is_corp_anomaly,
                 "selection_reason": f"VCP Breakout (ATR10<30) | RS Score {rs_score:.2f} | RVOL {rvol:.1f}x",
             })
 

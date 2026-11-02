@@ -421,3 +421,189 @@ def test_corporate_action_on_pending_exit_fill_day_cancels_automatic_fill(temp_p
     assert pos["current_stage"] == "Corporate Action Quarantine"
     assert temp_portfolio.state.pending_exits == []
     assert temp_portfolio.state.closed_trades == []
+
+
+def test_quarantined_position_blocks_tranche2(temp_portfolio):
+    """A quarantined position must NEVER receive Tranche-2 buys."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["tranche2_eligible"] = True
+    pos["is_quarantined"] = True
+
+    cash_before = temp_portfolio.state.cash
+    shares_before = pos["shares"]
+
+    # Next session open: Step 0a runs
+    temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-28", 1030.0, 1040.0, 1020.0, 1035.0), BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+
+    pos_after = temp_portfolio.state.active_positions["DIXON"]
+    assert pos_after["shares"] == shares_before
+    # Cash only accrues daily risk-free yield, no Tranche-2 deduction (~Rs 62,500)
+    assert temp_portfolio.state.cash == pytest.approx(cash_before * (1.0 + temp_portfolio.cash_yield_daily))
+    assert pos_after["tranche2_active"] is False
+
+
+def test_step00_cancelled_pending_exit_resets_tranche2_and_alerts(temp_portfolio):
+    """When Step 00 cancels a pending exit due to anomaly, it must alert and reset tranche2_eligible."""
+    _enter(temp_portfolio)
+    # Queue stop exit
+    stop_signal = _bar("2026-10-28", 950.0, 955.0, 925.0, 935.0)
+    temp_portfolio.execute_daily_rebalance(
+        stop_signal, BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+    assert len(temp_portfolio.state.pending_exits) == 1
+
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["tranche2_eligible"] = True  # hypothesize eligibility flag was set
+
+    # Fill day anomaly
+    anomaly = pd.DataFrame([{
+        "date": "2026-10-29", "symbol": "DIXON",
+        "open": 550.0, "high": 560.0, "low": 540.0, "close": 550.0,
+        "volume": 50_000, "prev_close": 935.0, "is_corporate_anomaly": True,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(
+        anomaly, BENCH, pd.DataFrame(), current_date_str="2026-10-29"
+    )
+
+    assert pos["is_quarantined"] is True
+    assert pos["tranche2_eligible"] is False
+    assert pos["tranche2_active"] is False
+    assert any("PENDING EXIT CANCELLED" in a for a in res["actions_taken"])
+
+
+def test_quarantine_timeout_after_three_sessions(temp_portfolio):
+    """Unresolved quarantine must trigger QUARANTINE_TIMEOUT exit after 3 sessions and cleanly exit."""
+    _enter(temp_portfolio)
+
+    # Session 1: Anomaly detected
+    a1 = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 550.0, "high": 560.0, "low": 540.0, "close": 550.0,
+        "volume": 50_000, "prev_close": 1025.0, "is_corporate_anomaly": True,
+    }])
+    res1 = temp_portfolio.execute_daily_rebalance(a1, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    assert pos["is_quarantined"] is True
+    assert pos["anomaly_days"] == 1
+    assert temp_portfolio.state.pending_exits == []
+
+    # Session 2: Anomaly persists
+    a2 = pd.DataFrame([{
+        "date": "2026-10-29", "symbol": "DIXON",
+        "open": 540.0, "high": 550.0, "low": 535.0, "close": 545.0,
+        "volume": 40_000, "prev_close": 550.0, "is_corporate_anomaly": True,
+    }])
+    temp_portfolio.execute_daily_rebalance(a2, BENCH, pd.DataFrame(), current_date_str="2026-10-29")
+    assert pos["anomaly_days"] == 2
+    assert temp_portfolio.state.pending_exits == []
+
+    # Session 3: Anomaly persists -> reaches 3 sessions, timeout exit queued
+    a3 = pd.DataFrame([{
+        "date": "2026-10-30", "symbol": "DIXON",
+        "open": 545.0, "high": 555.0, "low": 530.0, "close": 540.0,
+        "volume": 45_000, "prev_close": 545.0, "is_corporate_anomaly": True,
+    }])
+    res3 = temp_portfolio.execute_daily_rebalance(a3, BENCH, pd.DataFrame(), current_date_str="2026-10-30")
+    assert pos["anomaly_days"] == 3
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert "QUARANTINE_TIMEOUT" in temp_portfolio.state.pending_exits[0]["exit_reason"]
+    assert any("QUARANTINE TIMEOUT" in a for a in res3["actions_taken"])
+
+    # Session 4: Next morning, Step 00 fills QUARANTINE_TIMEOUT exit at open
+    s4 = pd.DataFrame([{
+        "date": "2026-10-31", "symbol": "DIXON",
+        "open": 542.0, "high": 560.0, "low": 540.0, "close": 555.0,
+        "volume": 60_000, "prev_close": 540.0,
+    }])
+    res4 = temp_portfolio.execute_daily_rebalance(s4, BENCH, pd.DataFrame(), current_date_str="2026-10-31")
+    assert "DIXON" not in temp_portfolio.state.active_positions
+    assert len(temp_portfolio.state.closed_trades) == 1
+    assert "QUARANTINE_TIMEOUT" in temp_portfolio.state.closed_trades[0]["exit_reason"]
+    assert temp_portfolio.state.pending_exits == []
+
+
+def test_manual_corporate_action_resolution(temp_portfolio):
+    """resolve_corporate_action correctly scales shares, prices, capital and clears quarantine."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["is_quarantined"] = True
+    pos["anomaly_days"] = 2
+    pos["current_stage"] = "Corporate Action Quarantine"
+
+    old_shares = float(pos["shares"])
+    old_entry = float(pos["entry_price"])
+    old_inv = float(pos["invested_capital"])
+
+    # 2:1 stock split
+    res = temp_portfolio.resolve_corporate_action("DIXON", split_ratio=2.0, cost_basis_factor=1.0)
+    assert res["new_shares"] == pytest.approx(old_shares * 2.0)
+    assert res["new_entry_price"] == pytest.approx(old_entry / 2.0)
+    assert res["new_invested_capital"] == pytest.approx(old_inv)
+
+    assert pos["is_quarantined"] is False
+    assert pos["anomaly_days"] == 0
+    assert pos["current_stage"] == "Stage 1: Ignition Defense"
+
+    # Validation errors
+    with pytest.raises(ValueError):
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=0.0)
+    with pytest.raises(ValueError):
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=-2.0)
+    with pytest.raises(ValueError):
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=float("nan"))
+    with pytest.raises(KeyError):
+        temp_portfolio.resolve_corporate_action("NONEXISTENT", split_ratio=2.0)
+
+
+def test_corrupt_state_backup_and_fail_closed(tmp_path):
+    """Corrupt state JSON file must be backed up to .corrupt.bak and raise RuntimeError."""
+    corrupt_file = tmp_path / "corrupt_portfolio.json"
+    corrupt_file.write_text("{ this is corrupt json invalid syntax", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        LivePortfolioManager(state_path=corrupt_file, initial_capital=1_000_000.0)
+
+    assert "is corrupted" in str(exc_info.value)
+    # Check that a backup file was created
+    bak_files = list(tmp_path.glob("corrupt_portfolio.json.corrupt.bak.*"))
+    assert len(bak_files) == 1
+    assert "{ this is corrupt json invalid syntax" in bak_files[0].read_text(encoding="utf-8")
+
+
+def test_same_day_rerun_equity_history_deduplication(temp_portfolio):
+    """Rebalance run multiple times on same date must update in-place, not duplicate equity records."""
+    temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), BENCH, CAND, current_date_str="2026-10-26"
+    )
+    assert len(temp_portfolio.state.daily_equity_history) == 1
+
+    # Rerun on same date
+    temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), BENCH, CAND, current_date_str="2026-10-26"
+    )
+    assert len(temp_portfolio.state.daily_equity_history) == 1
+
+
+def test_benchmark_missing_or_short_fails_closed(temp_portfolio):
+    """Missing, empty, or <200 bar benchmark must strictly fail-closed (regime_ok=False)."""
+    # None benchmark
+    res_none = temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), None, CAND, current_date_str="2026-10-26"
+    )
+    assert res_none["regime_ok"] is False
+
+    # Empty benchmark
+    res_empty = temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), pd.DataFrame(), CAND, current_date_str="2026-10-26"
+    )
+    assert res_empty["regime_ok"] is False
+
+    # Short benchmark (< 200 bars)
+    short_bench = pd.DataFrame({"date": pd.bdate_range(end="2026-10-26", periods=50), "close": 24000.0})
+    res_short = temp_portfolio.execute_daily_rebalance(
+        _bar("2026-10-26", 1000.0, 1010.0, 990.0, 1000.0), short_bench, CAND, current_date_str="2026-10-26"
+    )
+    assert res_short["regime_ok"] is False

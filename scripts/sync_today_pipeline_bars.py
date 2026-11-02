@@ -52,39 +52,37 @@ def sync_today():
             try:
                 if sym in raw["Close"]:
                     sym_c = raw["Close"][sym].dropna()
-                    sym_o = raw["Open"][sym].dropna() if "Open" in raw and sym in raw["Open"] else sym_c
-                    sym_h = raw["High"][sym].dropna() if "High" in raw and sym in raw["High"] else sym_c
-                    sym_l = raw["Low"][sym].dropna() if "Low" in raw and sym in raw["Low"] else sym_c
-                    sym_v = raw["Volume"][sym].dropna() if "Volume" in raw and sym in raw["Volume"] else pd.Series(0, index=sym_c.index)
+                    sym_o = raw["Open"][sym].dropna() if "Open" in raw and sym in raw["Open"] else pd.Series(dtype=float)
+                    sym_h = raw["High"][sym].dropna() if "High" in raw and sym in raw["High"] else pd.Series(dtype=float)
+                    sym_l = raw["Low"][sym].dropna() if "Low" in raw and sym in raw["Low"] else pd.Series(dtype=float)
+                    sym_v = raw["Volume"][sym].dropna() if "Volume" in raw and sym in raw["Volume"] else pd.Series(dtype=float)
 
                     for dt in sym_c.index:
-                        dt_utc = pd.to_datetime(dt, utc=True)
-                        new_rows.append({
-                            "date": dt_utc,
-                            "open": float(sym_o.loc[dt]) if dt in sym_o.index else float(sym_c.loc[dt]),
-                            "high": float(sym_h.loc[dt]) if dt in sym_h.index else float(sym_c.loc[dt]),
-                            "low": float(sym_l.loc[dt]) if dt in sym_l.index else float(sym_c.loc[dt]),
-                            "close": float(sym_c.loc[dt]),
-                            "volume": float(sym_v.loc[dt]) if dt in sym_v.index else 100000.0,
-                            "symbol": sym,
-                        })
+                        # Only accept genuine bars with valid OHLCV; never fabricate missing values
+                        if (
+                            dt in sym_o.index and pd.notna(sym_o.loc[dt])
+                            and dt in sym_h.index and pd.notna(sym_h.loc[dt])
+                            and dt in sym_l.index and pd.notna(sym_l.loc[dt])
+                            and dt in sym_v.index and pd.notna(sym_v.loc[dt])
+                        ):
+                            o_v = float(sym_o.loc[dt])
+                            h_v = float(sym_h.loc[dt])
+                            l_v = float(sym_l.loc[dt])
+                            c_v = float(sym_c.loc[dt])
+                            v_v = float(sym_v.loc[dt])
+                            if o_v > 0 and h_v >= max(o_v, l_v, c_v) and l_v <= min(o_v, h_v, c_v) and c_v > 0 and v_v >= 0:
+                                dt_utc = pd.to_datetime(dt, utc=True)
+                                new_rows.append({
+                                    "date": dt_utc,
+                                    "open": o_v,
+                                    "high": h_v,
+                                    "low": l_v,
+                                    "close": c_v,
+                                    "volume": v_v,
+                                    "symbol": sym,
+                                })
             except Exception as e:
                 logger.warning(f"Error parsing {sym}: {e}")
-
-    # Fallback for ZOMATO & TATAMOTORS if failed on yfinance
-    # Keep their bars progressing with recent market action
-    dates_to_add = [pd.to_datetime("2026-10-22", utc=True), pd.to_datetime("2026-10-23", utc=True)]
-    for sym, last_c in [("ZOMATO.NS", 308.50), ("TATAMOTORS.NS", 267.40)]:
-        for dt_add in dates_to_add:
-            new_rows.append({
-                "date": dt_add,
-                "open": last_c * 0.995,
-                "high": last_c * 1.015,
-                "low": last_c * 0.99,
-                "close": last_c,
-                "volume": 25000000.0,
-                "symbol": sym,
-            })
 
     if new_rows:
         new_df = pd.DataFrame(new_rows)

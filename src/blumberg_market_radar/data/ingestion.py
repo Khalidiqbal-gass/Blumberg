@@ -849,19 +849,12 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             "volume": pd.to_numeric(raw["volume"], errors="coerce"),
         }).dropna()
         return validate_ohlcv(bench, clean_glitches=True)
-    except Exception:
-        # Fallback synthetic benchmark
-        dates = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=300, freq="B")
-        prices = 22000.0 * np.exp(np.cumsum(np.random.normal(0.0004, 0.008, len(dates))))
-        return pd.DataFrame({
-            "date": dates,
-            "symbol": "NIFTY50",
-            "open": prices * 0.998,
-            "high": prices * 1.005,
-            "low": prices * 0.995,
-            "close": prices,
-            "volume": 200000000,
-        })
+    except Exception as exc:
+        logger.error(f"Benchmark fetch failed for {BENCHMARK_SYMBOL}: {exc}")
+        raise RuntimeError(
+            f"Failed to fetch live benchmark data for {BENCHMARK_SYMBOL}: {exc}. "
+            "Synthetic benchmark fallback is permanently disabled to prevent trading on fabricated data."
+        ) from exc
 
 
 def generate_synthetic_universe(

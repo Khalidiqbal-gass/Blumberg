@@ -18,6 +18,8 @@ Manages an active portfolio ledger implementing:
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -144,7 +146,18 @@ class LivePortfolioManager:
                     pending_exits=data.get("pending_exits", []),
                 )
             except Exception as exc:
-                logger.warning(f"Could not parse state file: {exc}. Starting fresh.")
+                bak_path = self.state_path.with_name(
+                    f"{self.state_path.name}.corrupt.bak.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
+                try:
+                    shutil.copy2(self.state_path, bak_path)
+                    logger.error(f"State file {self.state_path} corrupted: {exc}. Backed up to {bak_path}")
+                except Exception as b_exc:
+                    logger.error(f"Failed to backup corrupt state: {b_exc}")
+                raise RuntimeError(
+                    f"Portfolio state file {self.state_path} is corrupted ({exc}). "
+                    f"Backed up to {bak_path}. Aborting to prevent silent state wipe."
+                ) from exc
 
         today_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         fresh = LivePortfolioState(
@@ -160,10 +173,15 @@ class LivePortfolioManager:
         return fresh
 
     def save_state(self, state: LivePortfolioState | None = None) -> None:
-        """Save portfolio state to JSON."""
+        """Save portfolio state to JSON atomically."""
         target = state or self.state
-        with open(self.state_path, "w", encoding="utf-8") as f:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.state_path.with_name(f"{self.state_path.name}.tmp.{os.getpid()}")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(asdict(target), f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self.state_path)
 
     def reset_portfolio(self, capital: float | None = None) -> LivePortfolioState:
         """Completely reset portfolio ledger with new capital."""
@@ -180,6 +198,114 @@ class LivePortfolioManager:
         )
         self.save_state()
         return self.state
+
+    def resolve_corporate_action(
+        self,
+        symbol: str,
+        split_ratio: float,
+        cost_basis_factor: float = 1.0,
+    ) -> dict:
+        """Manually resolve a corporate action (split, bonus, or demerger) for a quarantined position.
+
+        Parameters
+        ----------
+        symbol : str
+            The equity ticker (e.g. 'VEDL' or 'DIXON').
+        split_ratio : float
+            Multiplier for share quantity (e.g., 2.0 for 2:1 split; 1.5 for 3:2 bonus).
+            Must be a positive finite float (> 0).
+        cost_basis_factor : float
+            Adjustment factor for invested capital / cost basis (e.g., 1.0 for pure split/bonus;
+            0.80 if 20% value separated in a demerger). Must be positive finite float (> 0).
+
+        Returns
+        -------
+        dict
+            Adjustment audit summary containing old and new position values.
+        """
+        sym = str(symbol).upper().replace(".NS", "").replace(".BO", "").strip()
+        if sym not in self.state.active_positions:
+            raise KeyError(f"Symbol {sym!r} is not currently an active position in portfolio.")
+
+        if not (isinstance(split_ratio, (int, float)) and np.isfinite(split_ratio) and split_ratio > 0):
+            raise ValueError(f"Invalid split_ratio {split_ratio!r}; must be a positive finite number.")
+        if not (isinstance(cost_basis_factor, (int, float)) and np.isfinite(cost_basis_factor) and cost_basis_factor > 0):
+            raise ValueError(f"Invalid cost_basis_factor {cost_basis_factor!r}; must be a positive finite number.")
+
+        split_ratio = float(split_ratio)
+        cost_basis_factor = float(cost_basis_factor)
+
+        pos = self.state.active_positions[sym]
+        old_shares = float(pos["shares"])
+        old_entry_price = float(pos["entry_price"])
+        old_invested_cap = float(pos["invested_capital"])
+
+        # 1. Scale shares up by split_ratio
+        new_shares = old_shares * split_ratio
+        pos["shares"] = new_shares
+
+        # 2. Adjust entry price per share: old_price * cost_basis_factor / split_ratio
+        price_adj_multiplier = cost_basis_factor / split_ratio
+        pos["entry_price"] = old_entry_price * price_adj_multiplier
+        if "entry_price_with_friction" in pos:
+            pos["entry_price_with_friction"] = float(pos["entry_price_with_friction"]) * price_adj_multiplier
+
+        # 3. Adjust tranche-specific details if present
+        if "tranche1_shares" in pos and pos["tranche1_shares"]:
+            pos["tranche1_shares"] = float(pos["tranche1_shares"]) * split_ratio
+        if "tranche1_price" in pos and pos["tranche1_price"]:
+            pos["tranche1_price"] = float(pos["tranche1_price"]) * price_adj_multiplier
+        if "tranche2_shares" in pos and pos["tranche2_shares"]:
+            pos["tranche2_shares"] = float(pos["tranche2_shares"]) * split_ratio
+        if "tranche2_price" in pos and pos["tranche2_price"]:
+            pos["tranche2_price"] = float(pos["tranche2_price"]) * price_adj_multiplier
+
+        # 4. Scale peak price, profit floor, stop loss, and current price
+        if "peak_price" in pos and pos["peak_price"]:
+            pos["peak_price"] = float(pos["peak_price"]) * price_adj_multiplier
+        if "profit_floor_price" in pos and pos["profit_floor_price"]:
+            pos["profit_floor_price"] = float(pos["profit_floor_price"]) * price_adj_multiplier
+        if "stop_loss_price" in pos and pos["stop_loss_price"]:
+            pos["stop_loss_price"] = float(pos["stop_loss_price"]) * price_adj_multiplier
+        if "current_price" in pos and pos["current_price"]:
+            pos["current_price"] = float(pos["current_price"]) * price_adj_multiplier
+
+        # 5. Invested capital scales by cost_basis_factor
+        new_invested_cap = old_invested_cap * cost_basis_factor
+        pos["invested_capital"] = new_invested_cap
+
+        # 6. Clear quarantine flags and reset anomaly counter
+        pos["is_quarantined"] = False
+        pos["anomaly_days"] = 0
+        pos["current_stage"] = "Stage 1: Ignition Defense"
+
+        # 7. Remove any queued quarantine timeout exit orders
+        self.state.pending_exits = [
+            pe for pe in self.state.pending_exits
+            if not (pe.get("symbol") == sym and "QUARANTINE" in pe.get("exit_reason", ""))
+        ]
+
+        # 8. Persist atomically
+        self.save_state()
+
+        logger.info(
+            f"Resolved corporate action for {sym}: shares {old_shares:.1f} -> {new_shares:.1f}, "
+            f"entry Rs {old_entry_price:.2f} -> Rs {pos['entry_price']:.2f}, "
+            f"invested Rs {old_invested_cap:.2f} -> Rs {new_invested_cap:.2f}."
+        )
+
+        return {
+            "symbol": sym,
+            "old_shares": old_shares,
+            "new_shares": new_shares,
+            "old_entry_price": old_entry_price,
+            "new_entry_price": pos["entry_price"],
+            "old_invested_capital": old_invested_cap,
+            "new_invested_capital": new_invested_cap,
+            "split_ratio": split_ratio,
+            "cost_basis_factor": cost_basis_factor,
+            "is_quarantined": False,
+        }
 
     def get_summary(self, latest_prices: dict[str, float] | None = None) -> dict:
         """Compute live portfolio metrics."""
@@ -237,24 +363,29 @@ class LivePortfolioManager:
         actions_taken = []
         is_same_day_rerun = (self.state.last_rebalance_date == today_date)
 
-        # 1. Benchmark Regime Check
+        # 1. Benchmark Regime Check (Strictly fail-closed when data is missing or incomplete)
         regime_ok = True
-        if enforce_regime and bench_df is not None and not bench_df.empty and "date" in bench_df.columns and "close" in bench_df.columns:
-            bench_sorted = bench_df.sort_values("date").reset_index(drop=True)
-            # Fewer than 200 benchmark bars means the EMA200 is not meaningful: block new entries
-            # rather than silently substituting EMA50 (which would weaken the filter).
-            if len(bench_sorted) < 200:
+        if enforce_regime:
+            if bench_df is None or bench_df.empty or "date" not in bench_df.columns or "close" not in bench_df.columns:
                 regime_ok = False
+                logger.warning("Benchmark data missing or invalid: regime set to fail-closed (regime_ok=False)")
             else:
-                bench_close = bench_sorted["close"].iloc[-1]
-                bench_ema50 = bench_sorted["close"].ewm(span=50, adjust=False).mean().iloc[-1]
-                bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1]
-                if self.regime_mode == "AND":
-                    regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200))
-                elif self.regime_mode == "AND_TREND":
-                    regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200) and (bench_ema50 > bench_ema200))
+                bench_sorted = bench_df.sort_values("date").reset_index(drop=True)
+                # Fewer than 200 benchmark bars means the EMA200 is not meaningful: block new entries
+                # rather than silently substituting EMA50 (which would weaken the filter).
+                if len(bench_sorted) < 200:
+                    regime_ok = False
+                    logger.warning(f"Benchmark has only {len(bench_sorted)} bars (<200): regime set to fail-closed (regime_ok=False)")
                 else:
-                    regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
+                    bench_close = bench_sorted["close"].iloc[-1]
+                    bench_ema50 = bench_sorted["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+                    bench_ema200 = bench_sorted["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+                    if self.regime_mode == "AND":
+                        regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200))
+                    elif self.regime_mode == "AND_TREND":
+                        regime_ok = bool((bench_close > bench_ema50) and (bench_close > bench_ema200) and (bench_ema50 > bench_ema200))
+                    else:
+                        regime_ok = bool((bench_close > bench_ema50) or (bench_close > bench_ema200))
 
         # Accrue daily cash yield (Only once per calendar day)
         if not is_same_day_rerun:
@@ -341,9 +472,15 @@ class LivePortfolioManager:
                         actions_taken.append(f"⚠️ PENDING EXIT HELD: {psym} had no session bar today. Retrying next session.")
                         continue
 
-                    if _is_corporate_action_anomaly(b, pos):
+                    if "QUARANTINE_TIMEOUT" not in pe.get("exit_reason", "") and _is_corporate_action_anomaly(b, pos):
                         pos["is_quarantined"] = True
                         pos["current_stage"] = "Corporate Action Quarantine"
+                        pos["tranche2_eligible"] = False
+                        if not is_same_day_rerun:
+                            pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
+                        actions_taken.append(
+                            f"⚠️ PENDING EXIT CANCELLED: {psym} quarantined due to corporate action anomaly. Automated exit halted."
+                        )
                         continue
 
                     open_p = float(b["open"])
@@ -393,6 +530,8 @@ class LivePortfolioManager:
 
             # 0a. Tranche 2 (flagged eligible at yesterday's close) fills at today's open
             for sym, pos in list(self.state.active_positions.items()):
+                if pos.get("is_quarantined", False):
+                    continue
                 if pos.get("tranche2_eligible") and not pos.get("tranche2_active", False):
                     pos["tranche2_eligible"] = False
                     b = _bar_today(sym)
@@ -506,17 +645,38 @@ class LivePortfolioManager:
 
             if is_corp_action_anomaly:
                 pos["is_quarantined"] = True
+                pos["tranche2_eligible"] = False
                 stage_name = "Corporate Action Quarantine"
                 if not is_same_day_rerun:
                     pos["anomaly_days"] = int(pos.get("anomaly_days", 0)) + 1
-                logger.warning(
-                    f"Potential unadjusted corporate action / demerger anomaly in {sym}. "
-                    "Quarantining position; automated liquidation halted."
-                )
-                actions_taken.append(
-                    f"QUARANTINE / ALERT: {sym} may have an unadjusted corporate action. "
-                    "Automated exits and additions are halted pending manual adjustment."
-                )
+
+                # If unresolved for 3 trading sessions, queue QUARANTINE_TIMEOUT exit to prevent indefinite lockup
+                if int(pos.get("anomaly_days", 0)) >= 3:
+                    already_pending = any(pe["symbol"] == sym for pe in self.state.pending_exits)
+                    if not already_pending and not is_same_day_rerun:
+                        self.state.pending_exits.append({
+                            "symbol": sym,
+                            "signal_date": today_date,
+                            "exit_reason": "QUARANTINE_TIMEOUT: Unresolved Corporate Action (>3 sessions)",
+                            "stage_at_signal": "Corporate Action Quarantine",
+                            "signal_price": close_p,
+                            "shares": pos["shares"],
+                            "attempt_count": 0,
+                        })
+                        pos["current_stage"] = "PENDING EXIT: QUARANTINE_TIMEOUT: Unresolved Corporate Action (>3 sessions)"
+                        actions_taken.append(
+                            f"🚨 QUARANTINE TIMEOUT: {sym} unresolved for {pos['anomaly_days']} sessions. "
+                            "Exit queued to sell at next session open."
+                        )
+                else:
+                    logger.warning(
+                        f"Potential unadjusted corporate action / demerger anomaly in {sym}. "
+                        "Quarantining position; automated liquidation halted."
+                    )
+                    actions_taken.append(
+                        f"QUARANTINE / ALERT: {sym} may have an unadjusted corporate action. "
+                        "Automated exits and additions are halted pending manual adjustment."
+                    )
             else:
                 # Tranche 2 eligibility (decided at today's close, filled at tomorrow's open).
                 if (not pos.get("tranche2_active", False)) and pos.get("bars_held", 0) >= (self.tranche2_days - 1):
@@ -728,13 +888,17 @@ class LivePortfolioManager:
         # Step D: Final Mark to Market & Save
         final_summary = self.get_summary(bars_latest["close"].to_dict())
         self.state.last_rebalance_date = today_date
-        self.state.daily_equity_history.append({
+        equity_record = {
             "date": today_date,
             "total_equity": final_summary["total_equity"],
             "cash": final_summary["cash"],
             "invested": final_summary["invested_capital"],
             "active_slots": final_summary["active_positions_count"],
-        })
+        }
+        if self.state.daily_equity_history and self.state.daily_equity_history[-1].get("date") == today_date:
+            self.state.daily_equity_history[-1] = equity_record
+        else:
+            self.state.daily_equity_history.append(equity_record)
         self.save_state()
 
         return {
