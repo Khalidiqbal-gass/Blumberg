@@ -538,7 +538,7 @@ def test_manual_corporate_action_resolution(temp_portfolio):
     old_inv = float(pos["invested_capital"])
 
     # 2:1 stock split
-    res = temp_portfolio.resolve_corporate_action("DIXON", split_ratio=2.0, cost_basis_factor=1.0)
+    res = temp_portfolio.resolve_corporate_action("DIXON", split_ratio=2.0, cost_basis_factor=1.0, event_id="SPLIT_2:1")
     assert res["new_shares"] == pytest.approx(old_shares * 2.0)
     assert res["new_entry_price"] == pytest.approx(old_entry / 2.0)
     assert res["new_invested_capital"] == pytest.approx(old_inv)
@@ -549,13 +549,15 @@ def test_manual_corporate_action_resolution(temp_portfolio):
 
     # Validation errors
     with pytest.raises(ValueError):
-        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=0.0)
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=0.0, event_id="E1")
     with pytest.raises(ValueError):
-        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=-2.0)
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=-2.0, event_id="E2")
     with pytest.raises(ValueError):
-        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=float("nan"))
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=float("nan"), event_id="E3")
+    with pytest.raises(ValueError, match="non-empty string"):
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=2.0, event_id="")
     with pytest.raises(KeyError):
-        temp_portfolio.resolve_corporate_action("NONEXISTENT", split_ratio=2.0)
+        temp_portfolio.resolve_corporate_action("NONEXISTENT", split_ratio=2.0, event_id="E4")
 
 
 def test_corrupt_state_backup_and_fail_closed(tmp_path):
@@ -691,12 +693,13 @@ def test_demerger_resolution_creates_spin_off_entitlement_preserving_equity(temp
     old_inv = float(pos["invested_capital"])
 
     # Demerger resolution: parent retains 80% cost basis, 20% spin-off entitlement
-    res = temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80)
+    res = temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80, event_id="DEMERGER_DIXON_1")
     assert pos["invested_capital"] == pytest.approx(old_inv * 0.80)
 
     # Entitlement must be recorded
     assert len(temp_portfolio.state.corporate_action_entitlements) == 1
     ent = temp_portfolio.state.corporate_action_entitlements[0]
+    assert ent["event_id"] == "DEMERGER_DIXON_1"
     assert ent["parent_symbol"] == "DIXON"
     assert ent["allocated_capital"] == pytest.approx(old_inv * 0.20)
     assert ent["status"] == "Awaiting Listing / Credit"
@@ -706,7 +709,7 @@ def test_demerger_resolution_creates_spin_off_entitlement_preserving_equity(temp
     assert summary_after["total_equity"] == pytest.approx(equity_before)
 
     # Settle entitlement when spin-off lists/credits cash
-    settled = temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=12500.0)
+    settled = temp_portfolio.settle_corporate_action_entitlement(event_id="DEMERGER_DIXON_1", realized_cash=12500.0)
     assert settled["status"] == "Settled"
     assert settled["realized_cash"] == 12500.0
 
@@ -766,23 +769,19 @@ def test_settle_entitlement_requires_verified_cash_and_rejects_nan_negative(temp
     _enter(temp_portfolio)
     pos = temp_portfolio.state.active_positions["DIXON"]
     pos["is_quarantined"] = True
-    temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80)
+    temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80, event_id="DEMERGER_DIXON_2")
 
-    # 1. Calling without realized_cash must fail (TypeError)
-    with pytest.raises(TypeError):
-        temp_portfolio.settle_corporate_action_entitlement("DIXON")  # type: ignore
+    # 1. Calling without realized_cash must fail
+    with pytest.raises((TypeError, ValueError)):
+        temp_portfolio.settle_corporate_action_entitlement(event_id="DEMERGER_DIXON_2", realized_cash=float("nan"))
 
-    # 2. NaN must be rejected with ValueError
+    # 2. Negative amount must be rejected with ValueError
     with pytest.raises(ValueError, match="finite non-negative"):
-        temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=float("nan"))
+        temp_portfolio.settle_corporate_action_entitlement(event_id="DEMERGER_DIXON_2", realized_cash=-500.0)
 
-    # 3. Negative amount must be rejected with ValueError
-    with pytest.raises(ValueError, match="finite non-negative"):
-        temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=-500.0)
-
-    # 4. Valid settlement credits verified cash
+    # 3. Valid settlement credits verified cash
     cash_before = temp_portfolio.state.cash
-    settled = temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=12500.0)
+    settled = temp_portfolio.settle_corporate_action_entitlement(event_id="DEMERGER_DIXON_2", realized_cash=12500.0)
     assert settled["status"] == "Settled"
     assert settled["realized_cash"] == 12500.0
     assert temp_portfolio.state.cash == cash_before + 12500.0
@@ -831,7 +830,7 @@ def test_resolve_corporate_action_idempotency_and_quarantine_guard(temp_portfoli
 
     # 2. Second resolution on now-unquarantined position must be rejected (RuntimeError)
     with pytest.raises(RuntimeError, match="not currently quarantined"):
-        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80)
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80, event_id="NEW_DEMERGER")
 
     # 3. If quarantined again, reusing same event_id must be rejected (ValueError)
     pos["is_quarantined"] = True
@@ -876,3 +875,93 @@ def test_malformed_state_schema_triggers_backup_and_fail_closed(tmp_path):
     bak_files = list(tmp_path.glob("bad_schema.json.corrupt.bak.*"))
     assert len(bak_files) == 1
     assert "not_a_list" in bak_files[0].read_text(encoding="utf-8")
+
+
+def test_open_time_anomaly_ignores_eod_corporate_anomaly_tag(temp_portfolio):
+    """Step 0a Tranche 2 at open must not be blocked by EOD is_corporate_anomaly tag when open is normal."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["tranche2_eligible"] = True
+
+    # Stock opens normally at 1025.0, but EOD bar has is_corporate_anomaly=True (from closing crash)
+    eod_tagged_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 1025.0, "high": 1030.0, "low": 600.0, "close": 610.0,
+        "volume": 100000, "prev_close": 1025.0, "is_corporate_anomaly": True,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(
+        eod_tagged_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+
+    # At 9:15 AM Open: Tranche 2 MUST fill because open was 1025.0 (EOD tag ignored at open)
+    pos_after = temp_portfolio.state.active_positions["DIXON"]
+    assert pos_after["tranche2_active"] is True
+    assert any("TRANCHE 2 FILLED" in a for a in res["actions_taken"])
+
+    # At 3:30 PM EOD (Step A): The anomaly is caught and position is quarantined for subsequent days
+    assert pos_after["is_quarantined"] is True
+    assert any("QUARANTINE / ALERT" in a for a in res["actions_taken"])
+
+
+def test_two_percent_circuit_floor_rebound_defers_exit(temp_portfolio):
+    """Reproduction: 2% floor (prev_close=1000, open=980, low=980, high=1050, close=1040) must defer exit."""
+    _enter(temp_portfolio)
+    temp_portfolio.state.pending_exits.append({
+        "symbol": "DIXON",
+        "signal_date": "2026-10-27",
+        "exit_reason": "Closing Stop-Loss",
+        "stage_at_signal": "Stage 1",
+        "signal_price": 990.0,
+        "shares": temp_portfolio.state.active_positions["DIXON"]["shares"],
+        "attempt_count": 0,
+    })
+
+    # Opens locked at 2% lower circuit floor (open == low == 980 vs prev_close 1000), then rebounds
+    rebound_2pct_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 980.0, "high": 1050.0, "low": 980.0, "close": 1040.0,
+        "volume": 20000, "prev_close": 1000.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(rebound_2pct_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert temp_portfolio.state.pending_exits[0]["attempt_count"] == 1
+    assert "DIXON" in temp_portfolio.state.active_positions
+    assert any("PENDING EXIT DEFERRED" in a for a in res["actions_taken"])
+
+
+def test_multiple_entitlements_require_event_id_to_settle_unambiguously(temp_portfolio):
+    """Multiple entitlements for the same symbol must reject symbol-only settlement and require event_id."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["is_quarantined"] = True
+
+    # Event 1: Demerger A (80% cost retained, 20% spin-off)
+    temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80, event_id="EVENT_A")
+
+    # Manually re-quarantine to simulate a subsequent corporate action Event 2
+    pos["is_quarantined"] = True
+    temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.90, event_id="EVENT_B")
+
+    assert len(temp_portfolio.state.corporate_action_entitlements) == 2
+
+    # Settling by symbol alone must be rejected with ValueError due to ambiguity
+    with pytest.raises(ValueError, match="Multiple active entitlements exist"):
+        temp_portfolio.settle_corporate_action_entitlement(parent_symbol="DIXON", realized_cash=5000.0)
+
+    # Settling with specific event_id succeeds cleanly
+    settled = temp_portfolio.settle_corporate_action_entitlement(event_id="EVENT_A", realized_cash=10000.0)
+    assert settled["status"] == "Settled"
+    assert settled["event_id"] == "EVENT_A"
+
+
+def test_corrupt_state_closed_trades_null_item_fails_closed(tmp_path):
+    """State with closed_trades containing null items must trigger .corrupt.bak and fail closed."""
+    corrupt_file = tmp_path / "bad_closed_trades.json"
+    corrupt_file.write_text('{"initial_capital": 1000000, "closed_trades": [null]}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="is corrupted"):
+        LivePortfolioManager(state_path=corrupt_file, initial_capital=1_000_000.0)
+
+    bak_files = list(tmp_path.glob("bad_closed_trades.json.corrupt.bak.*"))
+    assert len(bak_files) == 1

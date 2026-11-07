@@ -91,6 +91,7 @@ class LivePortfolioState:
     pending_entries: list[dict] = field(default_factory=list)  # signals to be filled at the NEXT session open
     pending_exits: list[dict] = field(default_factory=list)  # exit orders queued at EOD to fill at NEXT session open
     corporate_action_entitlements: list[dict] = field(default_factory=list)  # unlisted/pending spin-offs from demergers
+    resolved_corporate_action_events: list[str] = field(default_factory=list)  # unique corporate action event IDs already processed
 
 
 class LivePortfolioManager:
@@ -139,21 +140,53 @@ class LivePortfolioManager:
                 if not isinstance(data, dict):
                     raise ValueError(f"State root must be a dict, got {type(data).__name__}")
 
-                # Schema validation for persisted fields
+                # Schema validation for all persisted list fields and nested item structures
                 for list_field in (
                     "closed_trades",
                     "daily_equity_history",
                     "pending_entries",
                     "pending_exits",
                     "corporate_action_entitlements",
+                    "resolved_corporate_action_events",
                 ):
                     val = data.get(list_field, [])
                     if not isinstance(val, list):
                         raise ValueError(f"Field {list_field!r} must be a list, got {type(val).__name__}")
-                    if list_field in ("pending_entries", "pending_exits", "corporate_action_entitlements"):
+                    if list_field != "resolved_corporate_action_events":
                         for idx, item in enumerate(val):
                             if not isinstance(item, dict):
                                 raise ValueError(f"Item {idx} in {list_field!r} must be a dict, got {type(item).__name__}")
+                    else:
+                        for idx, item in enumerate(val):
+                            if not isinstance(item, str):
+                                raise ValueError(f"Item {idx} in {list_field!r} must be a str, got {type(item).__name__}")
+
+                # Deep validation of nested list items to prevent NoneType / partial corruptions
+                for idx, ct in enumerate(data.get("closed_trades", [])):
+                    if not isinstance(ct.get("symbol"), str) or not ct.get("symbol"):
+                        raise ValueError(f"closed_trades[{idx}] missing valid 'symbol'")
+                    if not isinstance(ct.get("net_pnl_rs"), (int, float)) or not np.isfinite(ct.get("net_pnl_rs")):
+                        raise ValueError(f"closed_trades[{idx}] missing finite 'net_pnl_rs'")
+
+                for idx, eh in enumerate(data.get("daily_equity_history", [])):
+                    if not isinstance(eh.get("date"), str) or not eh.get("date"):
+                        raise ValueError(f"daily_equity_history[{idx}] missing valid 'date'")
+                    if not isinstance(eh.get("total_equity"), (int, float)) or not np.isfinite(eh.get("total_equity")):
+                        raise ValueError(f"daily_equity_history[{idx}] missing finite 'total_equity'")
+
+                for idx, pe in enumerate(data.get("pending_entries", [])):
+                    if not isinstance(pe.get("symbol"), str) or not pe.get("symbol"):
+                        raise ValueError(f"pending_entries[{idx}] missing valid 'symbol'")
+
+                for idx, px in enumerate(data.get("pending_exits", [])):
+                    if not isinstance(px.get("symbol"), str) or not px.get("symbol"):
+                        raise ValueError(f"pending_exits[{idx}] missing valid 'symbol'")
+
+                for idx, ent in enumerate(data.get("corporate_action_entitlements", [])):
+                    if not isinstance(ent.get("parent_symbol"), str) or not ent.get("parent_symbol"):
+                        raise ValueError(f"corporate_action_entitlements[{idx}] missing valid 'parent_symbol'")
+                    if not isinstance(ent.get("allocated_capital"), (int, float)) or not np.isfinite(ent.get("allocated_capital")):
+                        raise ValueError(f"corporate_action_entitlements[{idx}] missing finite 'allocated_capital'")
 
                 active_pos = data.get("active_positions", {})
                 if not isinstance(active_pos, dict):
@@ -161,6 +194,9 @@ class LivePortfolioManager:
                 for sym_key, pos_val in active_pos.items():
                     if not isinstance(pos_val, dict):
                         raise ValueError(f"active_positions[{sym_key!r}] must be a dict, got {type(pos_val).__name__}")
+                    for req_f in ("shares", "entry_price", "invested_capital"):
+                        if req_f not in pos_val or not isinstance(pos_val[req_f], (int, float)) or not np.isfinite(pos_val[req_f]):
+                            raise ValueError(f"active_positions[{sym_key!r}] missing finite '{req_f}'")
 
                 cash_val = data.get("cash", self.initial_capital)
                 if not (isinstance(cash_val, (int, float)) and np.isfinite(cash_val) and cash_val >= 0.0):
@@ -177,6 +213,7 @@ class LivePortfolioManager:
                     pending_entries=data.get("pending_entries", []),
                     pending_exits=data.get("pending_exits", []),
                     corporate_action_entitlements=data.get("corporate_action_entitlements", []),
+                    resolved_corporate_action_events=data.get("resolved_corporate_action_events", []),
                 )
             except Exception as exc:
                 bak_path = self.state_path.with_name(
@@ -202,6 +239,7 @@ class LivePortfolioManager:
             last_rebalance_date="",
             created_at=today_str,
             corporate_action_entitlements=[],
+            resolved_corporate_action_events=[],
         )
         self.save_state(fresh)
         return fresh
@@ -239,7 +277,7 @@ class LivePortfolioManager:
         split_ratio: float,
         cost_basis_factor: float = 1.0,
         spinoff_market_value: float | None = None,
-        event_id: str | None = None,
+        event_id: str = "",
     ) -> dict:
         """Manually resolve a corporate action (split, bonus, or demerger) for a quarantined position.
 
@@ -276,16 +314,18 @@ class LivePortfolioManager:
             if not (isinstance(spinoff_market_value, (int, float)) and np.isfinite(spinoff_market_value) and spinoff_market_value >= 0.0):
                 raise ValueError(f"Invalid spinoff_market_value {spinoff_market_value!r}; must be a non-negative finite number.")
 
+        if not (isinstance(event_id, str) and event_id.strip()):
+            raise ValueError("event_id must be a non-empty string uniquely identifying this corporate action event.")
+        event_id = event_id.strip()
+
+        if event_id in self.state.resolved_corporate_action_events:
+            raise ValueError(f"Corporate action event {event_id!r} has already been resolved for this portfolio.")
+
         pos = self.state.active_positions[sym]
         if not pos.get("is_quarantined", False):
             raise RuntimeError(
                 f"Position {sym} is not currently quarantined. Cannot apply corporate action resolution to an unquarantined position."
             )
-
-        if event_id:
-            past_events = [x.get("event_id") for x in pos.get("resolved_corporate_actions", [])]
-            if event_id in past_events:
-                raise ValueError(f"Corporate action event {event_id!r} has already been resolved for {sym}.")
 
         split_ratio = float(split_ratio)
         cost_basis_factor = float(cost_basis_factor)
@@ -335,6 +375,7 @@ class LivePortfolioManager:
                 else (old_shares * old_current_price) * (1.0 - cost_basis_factor)
             )
             self.state.corporate_action_entitlements.append({
+                "event_id": event_id,
                 "parent_symbol": sym,
                 "entitlement_type": "SPIN_OFF",
                 "allocated_capital": carved_out_cap,
@@ -346,11 +387,15 @@ class LivePortfolioManager:
         new_invested_cap = old_invested_cap * cost_basis_factor
         pos["invested_capital"] = new_invested_cap
 
-        # Record audit resolution on position to prevent double-scaling
+        # Track event_id at state level to prevent duplicate application even after re-quarantine
+        if event_id not in self.state.resolved_corporate_action_events:
+            self.state.resolved_corporate_action_events.append(event_id)
+
+        # Record audit resolution on position
         if "resolved_corporate_actions" not in pos:
             pos["resolved_corporate_actions"] = []
         pos["resolved_corporate_actions"].append({
-            "event_id": event_id or f"CA_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "event_id": event_id,
             "split_ratio": split_ratio,
             "cost_basis_factor": cost_basis_factor,
             "spinoff_market_value": carved_out_mtm if cost_basis_factor < 1.0 else 0.0,
@@ -396,33 +441,52 @@ class LivePortfolioManager:
 
     def settle_corporate_action_entitlement(
         self,
-        parent_symbol: str,
-        realized_cash: float,
+        parent_symbol: str | None = None,
+        realized_cash: float = 0.0,
+        event_id: str | None = None,
     ) -> dict:
         """Settle a pending corporate action entitlement when spin-off proceeds are realized.
 
         Parameters
         ----------
-        parent_symbol : str
+        parent_symbol : str | None, optional
             The equity ticker (e.g. 'VEDL' or 'DIXON').
         realized_cash : float
             Actual verified cash proceeds received from liquidation/dividend/credit.
-            Must be a non-negative, finite float (>= 0.0). Defaults are rejected.
+            Must be a non-negative, finite float (>= 0.0).
+        event_id : str | None, optional
+            The specific unique corporate action event identifier.
+            Required if multiple unsettled entitlements exist for the same parent symbol.
 
         Returns
         -------
         dict
             The updated entitlement record with status 'Settled'.
         """
-        sym = str(parent_symbol).upper().replace(".NS", "").replace(".BO", "").strip()
-        matched = [e for e in self.state.corporate_action_entitlements if e.get("parent_symbol") == sym and e.get("status") != "Settled"]
-        if not matched:
-            raise KeyError(f"No active corporate action entitlement found for {sym!r}")
+        if event_id is None and parent_symbol is None:
+            raise ValueError("Must provide either event_id or parent_symbol to settle corporate action entitlement.")
 
         if not (isinstance(realized_cash, (int, float)) and np.isfinite(realized_cash) and realized_cash >= 0.0):
             raise ValueError(f"realized_cash must be a finite non-negative number, got {realized_cash!r}")
 
-        ent = matched[0]
+        matched = []
+        if event_id:
+            matched = [e for e in self.state.corporate_action_entitlements if e.get("event_id") == event_id and e.get("status") != "Settled"]
+            if not matched:
+                raise KeyError(f"No active corporate action entitlement found for event_id {event_id!r}")
+            ent = matched[0]
+        else:
+            sym = str(parent_symbol).upper().replace(".NS", "").replace(".BO", "").strip()
+            matched = [e for e in self.state.corporate_action_entitlements if e.get("parent_symbol") == sym and e.get("status") != "Settled"]
+            if not matched:
+                raise KeyError(f"No active corporate action entitlement found for symbol {sym!r}")
+            if len(matched) > 1:
+                active_events = [e.get("event_id") for e in matched]
+                raise ValueError(
+                    f"Multiple active entitlements exist for {sym!r} ({active_events}). "
+                    "Must specify event_id to settle unambiguously."
+                )
+            ent = matched[0]
         ent["status"] = "Settled"
         ent["settled_date"] = datetime.now().strftime("%Y-%m-%d")
         cash_added = float(realized_cash)
@@ -593,24 +657,42 @@ class LivePortfolioManager:
             return b_
 
         def _is_corporate_action_anomaly(bar_, position: dict, at_open: bool = False) -> bool:
-            tag = bar_.get("is_corporate_anomaly", False)
-            tagged = pd.notna(tag) and bool(tag)
             entry = float(position.get("entry_price", 0.0))
             peak = float(position.get("peak_price", entry))
             previous_price = position.get("current_price")
 
-            price_to_check = float(bar_["open"]) if at_open else float(bar_["low"])
-
-            return bool(
-                position.get("is_quarantined", False)
-                or tagged
-                or (entry > 0 and price_to_check <= entry * 0.65 and peak >= entry * 0.95)
-                or (
-                    previous_price is not None
-                    and float(previous_price) > 0
-                    and (price_to_check / float(previous_price) - 1.0) <= -0.35
+            if at_open:
+                # Time-causal at 9:15 AM Open:
+                # NEVER inspect the EOD 'is_corporate_anomaly' tag which is computed from full-day close!
+                # Only use pre-market corporate announcements, existing quarantine, or open-price gap down.
+                premarket_announced = bool(bar_.get("corporate_action_announced", False))
+                open_p = float(bar_["open"])
+                return bool(
+                    position.get("is_quarantined", False)
+                    or premarket_announced
+                    or (entry > 0 and open_p <= entry * 0.65 and peak >= entry * 0.95)
+                    or (
+                        previous_price is not None
+                        and float(previous_price) > 0
+                        and (open_p / float(previous_price) - 1.0) <= -0.35
+                    )
                 )
-            )
+            else:
+                # EOD Close (Step A): Full-day OHLC and EOD anomaly tags are final and known
+                tag = bar_.get("is_corporate_anomaly", False)
+                tagged = pd.notna(tag) and bool(tag)
+                low_p = float(bar_["low"])
+                close_p = float(bar_["close"])
+                return bool(
+                    position.get("is_quarantined", False)
+                    or tagged
+                    or (entry > 0 and low_p <= entry * 0.65 and peak >= entry * 0.95)
+                    or (
+                        previous_price is not None
+                        and float(previous_price) > 0
+                        and (min(low_p, close_p) / float(previous_price) - 1.0) <= -0.35
+                    )
+                )
 
         # Step 0: Fill orders queued yesterday at TODAY'S OPEN (identical to backtest: signal at close D, fill at open D+1).
         # Rule: Entries & Tranches at morning open can ONLY use cash & slots available from yesterday's close.
@@ -654,12 +736,22 @@ class LivePortfolioManager:
                     
                     # Lower circuit check at open:
                     # An exit order cannot execute if stock is locked limit-down without liquidity at market open.
-                    # Evaluates both flat-day limit lock and open-at-circuit-floor lock (open == low <= prev_close * 0.95)
-                    # unconditionally without lookahead to intraday rebound highs or closes.
+                    # Supports explicit exchange metadata (is_lower_circuit, circuit_limit_pct) and detects
+                    # open-at-floor locks across all exchange circuit bands (2% ESM/T2T, 5%, 10%, 20%) without
+                    # lookahead to intraday rebound highs or closes.
+                    circuit_limit = float(b.get("circuit_limit_pct", 0.0))
+                    drop_from_prev = (1.0 - open_p / prev_c) if (prev_c is not None and prev_c > 0) else 0.0
+
+                    if circuit_limit > 0:
+                        is_floor_lock = (open_p == low_p and open_p <= prev_c * (1.0 - circuit_limit + 1e-4))
+                    else:
+                        is_standard_band = any(abs(drop_from_prev - band) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
+                        is_floor_lock = (open_p == low_p and (is_standard_band or drop_from_prev >= 0.045))
+
                     is_lower_circuit = bool(
                         b.get("is_lower_circuit", False)
+                        or is_floor_lock
                         or (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)
-                        or (open_p == low_p and prev_c is not None and open_p <= prev_c * 0.95)
                     )
 
                     if is_lower_circuit:
