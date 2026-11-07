@@ -759,3 +759,120 @@ def test_open_at_floor_lower_circuit_defers_exit(temp_portfolio):
     assert temp_portfolio.state.pending_exits[0]["attempt_count"] == 1
     assert "DIXON" in temp_portfolio.state.active_positions
     assert any("PENDING EXIT DEFERRED" in a for a in res["actions_taken"])
+
+
+def test_settle_entitlement_requires_verified_cash_and_rejects_nan_negative(temp_portfolio):
+    """Entitlement settlement requires verified, finite, non-negative cash; no default fabrication."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["is_quarantined"] = True
+    temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80)
+
+    # 1. Calling without realized_cash must fail (TypeError)
+    with pytest.raises(TypeError):
+        temp_portfolio.settle_corporate_action_entitlement("DIXON")  # type: ignore
+
+    # 2. NaN must be rejected with ValueError
+    with pytest.raises(ValueError, match="finite non-negative"):
+        temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=float("nan"))
+
+    # 3. Negative amount must be rejected with ValueError
+    with pytest.raises(ValueError, match="finite non-negative"):
+        temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=-500.0)
+
+    # 4. Valid settlement credits verified cash
+    cash_before = temp_portfolio.state.cash
+    settled = temp_portfolio.settle_corporate_action_entitlement("DIXON", realized_cash=12500.0)
+    assert settled["status"] == "Settled"
+    assert settled["realized_cash"] == 12500.0
+    assert temp_portfolio.state.cash == cash_before + 12500.0
+
+
+def test_rebound_after_open_at_circuit_floor_still_defers_morning_exit(temp_portfolio):
+    """If stock opens locked at circuit floor, exit is deferred even if stock rebounds intraday."""
+    _enter(temp_portfolio)
+    temp_portfolio.state.pending_exits.append({
+        "symbol": "DIXON",
+        "signal_date": "2026-10-27",
+        "exit_reason": "Closing Stop-Loss (ATR / -8% Threshold)",
+        "stage_at_signal": "Stage 1: Ignition Defense",
+        "signal_price": 930.0,
+        "shares": temp_portfolio.state.active_positions["DIXON"]["shares"],
+        "attempt_count": 0,
+    })
+
+    # Opens locked at 5% floor (970 <= 1025 * 0.95), but rebounds intraday to 1050 and closes at 1040
+    rebound_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 970.0, "high": 1050.0, "low": 970.0, "close": 1040.0,
+        "volume": 50000, "prev_close": 1025.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(rebound_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert len(temp_portfolio.state.pending_exits) == 1
+    assert temp_portfolio.state.pending_exits[0]["attempt_count"] == 1
+    assert "DIXON" in temp_portfolio.state.active_positions
+    assert any("PENDING EXIT DEFERRED" in a for a in res["actions_taken"])
+
+
+def test_resolve_corporate_action_idempotency_and_quarantine_guard(temp_portfolio):
+    """resolve_corporate_action rejects unquarantined positions, repeated calls, and supports custom spinoff valuation."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["is_quarantined"] = True
+
+    # 1. First resolution with custom market value
+    res = temp_portfolio.resolve_corporate_action(
+        "DIXON", split_ratio=1.0, cost_basis_factor=0.80, spinoff_market_value=15000.0, event_id="DEMERGER_2026"
+    )
+    assert len(temp_portfolio.state.corporate_action_entitlements) == 1
+    assert temp_portfolio.state.corporate_action_entitlements[0]["market_value"] == 15000.0
+    assert pos["is_quarantined"] is False
+
+    # 2. Second resolution on now-unquarantined position must be rejected (RuntimeError)
+    with pytest.raises(RuntimeError, match="not currently quarantined"):
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80)
+
+    # 3. If quarantined again, reusing same event_id must be rejected (ValueError)
+    pos["is_quarantined"] = True
+    with pytest.raises(ValueError, match="already been resolved"):
+        temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80, event_id="DEMERGER_2026")
+
+
+def test_open_time_anomaly_uses_only_open_data_and_ignores_intraday_low_crash(temp_portfolio):
+    """Step 0a Tranche 2 at open must not be blocked by lookahead from future intraday crash."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["tranche2_eligible"] = True
+
+    # Stock opens normally at 1025.0, but later intraday crashes to 600.0 (-41%)
+    intraday_crash_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 1025.0, "high": 1030.0, "low": 600.0, "close": 610.0,
+        "volume": 100000, "prev_close": 1025.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(
+        intraday_crash_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28"
+    )
+
+    # At open (Step 0a): Tranche 2 was filled normally because open was 1025.0 (no anomaly at open)
+    pos_after = temp_portfolio.state.active_positions["DIXON"]
+    assert pos_after["tranche2_active"] is True
+    assert any("TRANCHE 2 FILLED" in a for a in res["actions_taken"])
+
+    # At EOD (Step A): The -41% crash was detected and position was properly quarantined for subsequent days
+    assert pos_after["is_quarantined"] is True
+    assert any("QUARANTINE / ALERT" in a for a in res["actions_taken"])
+
+
+def test_malformed_state_schema_triggers_backup_and_fail_closed(tmp_path):
+    """Malformed schema (e.g. non-list entitlements, non-dict positions) must trigger .corrupt.bak and fail closed."""
+    malformed_file = tmp_path / "bad_schema.json"
+    malformed_file.write_text('{"initial_capital": 1000000, "corporate_action_entitlements": "not_a_list"}', encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="is corrupted"):
+        LivePortfolioManager(state_path=malformed_file, initial_capital=1_000_000.0)
+
+    bak_files = list(tmp_path.glob("bad_schema.json.corrupt.bak.*"))
+    assert len(bak_files) == 1
+    assert "not_a_list" in bak_files[0].read_text(encoding="utf-8")

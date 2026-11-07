@@ -135,10 +135,41 @@ class LivePortfolioManager:
             try:
                 with open(self.state_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+
+                if not isinstance(data, dict):
+                    raise ValueError(f"State root must be a dict, got {type(data).__name__}")
+
+                # Schema validation for persisted fields
+                for list_field in (
+                    "closed_trades",
+                    "daily_equity_history",
+                    "pending_entries",
+                    "pending_exits",
+                    "corporate_action_entitlements",
+                ):
+                    val = data.get(list_field, [])
+                    if not isinstance(val, list):
+                        raise ValueError(f"Field {list_field!r} must be a list, got {type(val).__name__}")
+                    if list_field in ("pending_entries", "pending_exits", "corporate_action_entitlements"):
+                        for idx, item in enumerate(val):
+                            if not isinstance(item, dict):
+                                raise ValueError(f"Item {idx} in {list_field!r} must be a dict, got {type(item).__name__}")
+
+                active_pos = data.get("active_positions", {})
+                if not isinstance(active_pos, dict):
+                    raise ValueError(f"active_positions must be a dict, got {type(active_pos).__name__}")
+                for sym_key, pos_val in active_pos.items():
+                    if not isinstance(pos_val, dict):
+                        raise ValueError(f"active_positions[{sym_key!r}] must be a dict, got {type(pos_val).__name__}")
+
+                cash_val = data.get("cash", self.initial_capital)
+                if not (isinstance(cash_val, (int, float)) and np.isfinite(cash_val) and cash_val >= 0.0):
+                    raise ValueError(f"cash must be a finite non-negative number, got {cash_val!r}")
+
                 return LivePortfolioState(
                     initial_capital=float(data.get("initial_capital", self.initial_capital)),
-                    cash=float(data.get("cash", self.initial_capital)),
-                    active_positions=data.get("active_positions", {}),
+                    cash=float(cash_val),
+                    active_positions=active_pos,
                     closed_trades=data.get("closed_trades", []),
                     daily_equity_history=data.get("daily_equity_history", []),
                     last_rebalance_date=data.get("last_rebalance_date", ""),
@@ -207,6 +238,8 @@ class LivePortfolioManager:
         symbol: str,
         split_ratio: float,
         cost_basis_factor: float = 1.0,
+        spinoff_market_value: float | None = None,
+        event_id: str | None = None,
     ) -> dict:
         """Manually resolve a corporate action (split, bonus, or demerger) for a quarantined position.
 
@@ -220,6 +253,11 @@ class LivePortfolioManager:
         cost_basis_factor : float
             Adjustment factor for invested capital / cost basis (e.g., 1.0 for pure split/bonus;
             0.80 if 20% value separated in a demerger). Must be positive finite float (> 0).
+        spinoff_market_value : float | None, optional
+            Independent verified fair market value of the carved-out spin-off entitlement.
+            If None, defaults to the proportional market value (old_mtm * (1 - cost_basis_factor)).
+        event_id : str | None, optional
+            Unique corporate action event identifier for idempotency.
 
         Returns
         -------
@@ -234,11 +272,24 @@ class LivePortfolioManager:
             raise ValueError(f"Invalid split_ratio {split_ratio!r}; must be a positive finite number.")
         if not (isinstance(cost_basis_factor, (int, float)) and np.isfinite(cost_basis_factor) and cost_basis_factor > 0):
             raise ValueError(f"Invalid cost_basis_factor {cost_basis_factor!r}; must be a positive finite number.")
+        if spinoff_market_value is not None:
+            if not (isinstance(spinoff_market_value, (int, float)) and np.isfinite(spinoff_market_value) and spinoff_market_value >= 0.0):
+                raise ValueError(f"Invalid spinoff_market_value {spinoff_market_value!r}; must be a non-negative finite number.")
+
+        pos = self.state.active_positions[sym]
+        if not pos.get("is_quarantined", False):
+            raise RuntimeError(
+                f"Position {sym} is not currently quarantined. Cannot apply corporate action resolution to an unquarantined position."
+            )
+
+        if event_id:
+            past_events = [x.get("event_id") for x in pos.get("resolved_corporate_actions", [])]
+            if event_id in past_events:
+                raise ValueError(f"Corporate action event {event_id!r} has already been resolved for {sym}.")
 
         split_ratio = float(split_ratio)
         cost_basis_factor = float(cost_basis_factor)
 
-        pos = self.state.active_positions[sym]
         old_shares = float(pos["shares"])
         old_entry_price = float(pos["entry_price"])
         old_invested_cap = float(pos["invested_capital"])
@@ -275,9 +326,14 @@ class LivePortfolioManager:
             pos["current_price"] = float(pos["current_price"]) * price_adj_multiplier
 
         # 5. Invested capital scales by cost_basis_factor; for demergers, track carved-out spin-off entitlement
+        carved_out_mtm = 0.0
         if cost_basis_factor < 1.0:
             carved_out_cap = old_invested_cap * (1.0 - cost_basis_factor)
-            carved_out_mtm = (old_shares * old_current_price) * (1.0 - cost_basis_factor)
+            carved_out_mtm = (
+                float(spinoff_market_value)
+                if spinoff_market_value is not None
+                else (old_shares * old_current_price) * (1.0 - cost_basis_factor)
+            )
             self.state.corporate_action_entitlements.append({
                 "parent_symbol": sym,
                 "entitlement_type": "SPIN_OFF",
@@ -289,6 +345,21 @@ class LivePortfolioManager:
             })
         new_invested_cap = old_invested_cap * cost_basis_factor
         pos["invested_capital"] = new_invested_cap
+
+        # Record audit resolution on position to prevent double-scaling
+        if "resolved_corporate_actions" not in pos:
+            pos["resolved_corporate_actions"] = []
+        pos["resolved_corporate_actions"].append({
+            "event_id": event_id or f"CA_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "split_ratio": split_ratio,
+            "cost_basis_factor": cost_basis_factor,
+            "spinoff_market_value": carved_out_mtm if cost_basis_factor < 1.0 else 0.0,
+            "resolved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "old_shares": old_shares,
+            "new_shares": new_shares,
+            "old_invested_capital": old_invested_cap,
+            "new_invested_capital": new_invested_cap,
+        })
 
         # 6. Clear quarantine flags and reset anomaly counter
         pos["is_quarantined"] = False
@@ -326,17 +397,35 @@ class LivePortfolioManager:
     def settle_corporate_action_entitlement(
         self,
         parent_symbol: str,
-        realized_cash: float | None = None,
+        realized_cash: float,
     ) -> dict:
-        """Settle a pending corporate action entitlement when spin-off shares are credited/liquidated."""
+        """Settle a pending corporate action entitlement when spin-off proceeds are realized.
+
+        Parameters
+        ----------
+        parent_symbol : str
+            The equity ticker (e.g. 'VEDL' or 'DIXON').
+        realized_cash : float
+            Actual verified cash proceeds received from liquidation/dividend/credit.
+            Must be a non-negative, finite float (>= 0.0). Defaults are rejected.
+
+        Returns
+        -------
+        dict
+            The updated entitlement record with status 'Settled'.
+        """
         sym = str(parent_symbol).upper().replace(".NS", "").replace(".BO", "").strip()
         matched = [e for e in self.state.corporate_action_entitlements if e.get("parent_symbol") == sym and e.get("status") != "Settled"]
         if not matched:
             raise KeyError(f"No active corporate action entitlement found for {sym!r}")
+
+        if not (isinstance(realized_cash, (int, float)) and np.isfinite(realized_cash) and realized_cash >= 0.0):
+            raise ValueError(f"realized_cash must be a finite non-negative number, got {realized_cash!r}")
+
         ent = matched[0]
         ent["status"] = "Settled"
         ent["settled_date"] = datetime.now().strftime("%Y-%m-%d")
-        cash_added = float(realized_cash) if realized_cash is not None else float(ent.get("allocated_capital", 0.0))
+        cash_added = float(realized_cash)
         ent["realized_cash"] = cash_added
         self.state.cash += cash_added
         self.save_state()
@@ -503,20 +592,23 @@ class LivePortfolioManager:
                 return None
             return b_
 
-        def _is_corporate_action_anomaly(bar_, position: dict) -> bool:
+        def _is_corporate_action_anomaly(bar_, position: dict, at_open: bool = False) -> bool:
             tag = bar_.get("is_corporate_anomaly", False)
             tagged = pd.notna(tag) and bool(tag)
             entry = float(position.get("entry_price", 0.0))
             peak = float(position.get("peak_price", entry))
             previous_price = position.get("current_price")
+
+            price_to_check = float(bar_["open"]) if at_open else float(bar_["low"])
+
             return bool(
                 position.get("is_quarantined", False)
                 or tagged
-                or (entry > 0 and float(bar_["low"]) <= entry * 0.65 and peak >= entry * 0.95)
+                or (entry > 0 and price_to_check <= entry * 0.65 and peak >= entry * 0.95)
                 or (
                     previous_price is not None
                     and float(previous_price) > 0
-                    and (float(bar_["low"]) / float(previous_price) - 1.0) <= -0.35
+                    and (price_to_check / float(previous_price) - 1.0) <= -0.35
                 )
             )
 
@@ -543,7 +635,7 @@ class LivePortfolioManager:
                         actions_taken.append(f"⚠️ PENDING EXIT HELD: {psym} had no session bar today. Retrying next session.")
                         continue
 
-                    if "QUARANTINE_TIMEOUT" not in pe.get("exit_reason", "") and _is_corporate_action_anomaly(b, pos):
+                    if "QUARANTINE_TIMEOUT" not in pe.get("exit_reason", "") and _is_corporate_action_anomaly(b, pos, at_open=True):
                         pos["is_quarantined"] = True
                         pos["current_stage"] = "Corporate Action Quarantine"
                         pos["tranche2_eligible"] = False
@@ -561,10 +653,13 @@ class LivePortfolioManager:
                     prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else float(pos.get("current_price", open_p))
                     
                     # Lower circuit check at open:
-                    # An exit order cannot execute if stock is locked limit-down without liquidity.
-                    is_lower_circuit = (
-                        (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)
-                        or (open_p == low_p and prev_c is not None and open_p <= prev_c * 0.95 and (high_p == open_p or close_p <= open_p))
+                    # An exit order cannot execute if stock is locked limit-down without liquidity at market open.
+                    # Evaluates both flat-day limit lock and open-at-circuit-floor lock (open == low <= prev_close * 0.95)
+                    # unconditionally without lookahead to intraday rebound highs or closes.
+                    is_lower_circuit = bool(
+                        b.get("is_lower_circuit", False)
+                        or (open_p == low_p and high_p == low_p and prev_c is not None and close_p < prev_c)
+                        or (open_p == low_p and prev_c is not None and open_p <= prev_c * 0.95)
                     )
 
                     if is_lower_circuit:
@@ -616,7 +711,7 @@ class LivePortfolioManager:
                         continue
 
                     # FIX: Detect if today's open is an unadjusted corporate action gap-down!
-                    if _is_corporate_action_anomaly(b, pos):
+                    if _is_corporate_action_anomaly(b, pos, at_open=True):
                         pos["is_quarantined"] = True
                         pos["current_stage"] = "Corporate Action Quarantine"
                         if not is_same_day_rerun:
@@ -733,7 +828,7 @@ class LivePortfolioManager:
             ema100_v = float(bar["ema100"]) if "ema100" in bar and pd.notna(bar["ema100"]) else None
             is_climax = bool(pos.get("is_climax_reached", False))
 
-            is_corp_action_anomaly = _is_corporate_action_anomaly(bar, pos)
+            is_corp_action_anomaly = _is_corporate_action_anomaly(bar, pos, at_open=False)
 
             if is_corp_action_anomaly:
                 pos["is_quarantined"] = True
