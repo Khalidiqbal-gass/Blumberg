@@ -417,10 +417,18 @@ def apply_sector_cluster_guardrail(
     active_symbols: set[str] = set()
 
     if active_pipeline_df is not None and not active_pipeline_df.empty:
-        status_col = "status" if "status" in active_pipeline_df.columns else ("current_layer" if "current_layer" in active_pipeline_df.columns else None)
+        status_col = (
+            "status"
+            if "status" in active_pipeline_df.columns
+            else (
+                "current_layer"
+                if "current_layer" in active_pipeline_df.columns
+                else ("current_stage" if "current_stage" in active_pipeline_df.columns else None)
+            )
+        )
         if status_col:
             active_rows = active_pipeline_df[
-                ~active_pipeline_df[status_col].astype(str).str.contains("STOP_LOSS|DROPPED|EXIT", case=False, na=False)
+                ~active_pipeline_df[status_col].astype(str).str.contains("STOP_LOSS|DROPPED|EXIT|QUARANTINE_TIMEOUT", case=False, na=False)
             ]
         else:
             active_rows = active_pipeline_df

@@ -965,3 +965,92 @@ def test_corrupt_state_closed_trades_null_item_fails_closed(tmp_path):
 
     bak_files = list(tmp_path.glob("bad_closed_trades.json.corrupt.bak.*"))
     assert len(bak_files) == 1
+
+
+def test_upper_circuit_open_ceiling_blocks_new_entry(temp_portfolio):
+    """Stock opening locked at upper circuit ceiling (open == high >= prev_close * 1.05) cannot fill new entry."""
+    temp_portfolio.state.pending_entries.append({
+        "symbol": "LOCKUP", "signal_date": "2026-10-27", "sector": "Auto", "selection_reason": "VCP"
+    })
+
+    # Opens locked at 5% upper circuit ceiling (525 >= 500 * 1.05), but later intraday trades lower (low=510, close=520)
+    ceiling_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "LOCKUP",
+        "open": 525.0, "high": 525.0, "low": 510.0, "close": 520.0,
+        "volume": 50000, "prev_close": 500.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(ceiling_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert "LOCKUP" not in temp_portfolio.state.active_positions
+    assert any("locked at upper circuit ceiling at open" in a for a in res["actions_taken"])
+
+
+def test_upper_circuit_open_ceiling_defers_tranche2(temp_portfolio):
+    """Tranche 2 addition cannot fill at open if stock is locked limit-up at ceiling."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["tranche2_eligible"] = True
+    shares_before = pos["shares"]
+
+    # Opens at 5% upper circuit ceiling (1076.25 >= 1025 * 1.05), later trades lower
+    uc_bar = pd.DataFrame([{
+        "date": "2026-10-28", "symbol": "DIXON",
+        "open": 1076.25, "high": 1076.25, "low": 1060.0, "close": 1070.0,
+        "volume": 50000, "prev_close": 1025.0,
+    }])
+    res = temp_portfolio.execute_daily_rebalance(uc_bar, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    pos_after = temp_portfolio.state.active_positions["DIXON"]
+    assert pos_after["shares"] == shares_before
+    assert pos_after["tranche2_active"] is False
+    assert any("TRANCHE 2 DEFERRED" in a for a in res["actions_taken"])
+
+
+def test_eq_open_includes_corporate_action_entitlements(temp_portfolio):
+    """Step 0b slot_cap calculation must include corporate action entitlements value."""
+    _enter(temp_portfolio)
+    pos = temp_portfolio.state.active_positions["DIXON"]
+    pos["is_quarantined"] = True
+
+    # Demerger resolution creates spin-off entitlement
+    temp_portfolio.resolve_corporate_action("DIXON", split_ratio=1.0, cost_basis_factor=0.80, spinoff_market_value=25000.0, event_id="DEMERGER_SIZING")
+    assert len(temp_portfolio.state.corporate_action_entitlements) == 1
+
+    # Queue an entry candidate
+    temp_portfolio.state.pending_entries.append({
+        "symbol": "NEWSTOCK", "signal_date": "2026-10-27", "sector": "Auto", "selection_reason": "VCP"
+    })
+
+    day_bars = pd.DataFrame([
+        {"date": "2026-10-28", "symbol": "DIXON", "open": 820.0, "high": 830.0, "low": 815.0, "close": 825.0, "volume": 100000},
+        {"date": "2026-10-28", "symbol": "NEWSTOCK", "open": 500.0, "high": 510.0, "low": 495.0, "close": 505.0, "volume": 100000},
+    ])
+    temp_portfolio.execute_daily_rebalance(day_bars, BENCH, pd.DataFrame(), current_date_str="2026-10-28")
+
+    assert "NEWSTOCK" in temp_portfolio.state.active_positions
+    new_pos = temp_portfolio.state.active_positions["NEWSTOCK"]
+    # target_slot_capital must be ~125,000 (total equity ~1,000,000 / 8 slots)
+    assert new_pos["target_slot_capital"] == pytest.approx(126619.0, rel=0.01)
+
+
+def test_sector_guardrail_filters_exiting_positions_with_current_stage():
+    """apply_sector_cluster_guardrail must ignore positions with 'PENDING EXIT' in current_stage."""
+    from blumberg_market_radar.scanner.radar import apply_sector_cluster_guardrail
+
+    active_df = pd.DataFrame([
+        {"symbol": "AUTO1", "sector": "Auto", "current_stage": "Stage 1: Ignition Defense"},
+        {"symbol": "AUTO2", "sector": "Auto", "current_stage": "PENDING EXIT: Closing Stop-Loss"},  # Exiting!
+    ])
+    candidates = pd.DataFrame([
+        {"symbol": "AUTO3", "sector": "Auto", "radar_score": 90.0},
+    ])
+
+    approved, counts, free = apply_sector_cluster_guardrail(
+        candidates,
+        active_pipeline_df=active_df,
+        max_stocks_per_sector=2,
+        max_portfolio_slots=8,
+    )
+    # AUTO2 is exiting, so Auto sector count should be 1, allowing AUTO3 to be approved!
+    assert "AUTO3" in approved["symbol"].values
+    assert counts.get("Auto") == 2

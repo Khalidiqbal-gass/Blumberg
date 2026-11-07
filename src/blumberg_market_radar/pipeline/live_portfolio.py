@@ -799,7 +799,28 @@ class LivePortfolioManager:
                 if pos.get("tranche2_eligible") and not pos.get("tranche2_active", False):
                     pos["tranche2_eligible"] = False
                     b = _bar_today(sym)
-                    if b is None or float(b["high"]) == float(b["low"]):  # no bar / upper-circuit lock
+                    if b is None:
+                        continue
+                    t2_open_p = float(b["open"])
+                    t2_high_p = float(b["high"])
+                    t2_low_p = float(b["low"])
+                    t2_prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else float(pos.get("current_price", t2_open_p))
+                    t2_circuit_limit = float(b.get("circuit_limit_pct", 0.0))
+                    t2_rise_from_prev = (t2_open_p / t2_prev_c - 1.0) if (t2_prev_c > 0) else 0.0
+
+                    if t2_circuit_limit > 0:
+                        is_t2_ceiling_lock = (t2_open_p == t2_high_p and t2_open_p >= t2_prev_c * (1.0 + t2_circuit_limit - 1e-4))
+                    else:
+                        is_t2_std_upper = any(abs(t2_rise_from_prev - band) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
+                        is_t2_ceiling_lock = (t2_open_p == t2_high_p and (is_t2_std_upper or t2_rise_from_prev >= 0.045))
+
+                    is_t2_upper_circuit = bool(
+                        b.get("is_upper_circuit", False)
+                        or (t2_high_p == t2_low_p and t2_open_p > t2_prev_c)
+                        or is_t2_ceiling_lock
+                    )
+                    if is_t2_upper_circuit:
+                        actions_taken.append(f"⚠️ TRANCHE 2 DEFERRED: {sym} locked at upper circuit ceiling at open (no sellers).")
                         continue
 
                     # FIX: Detect if today's open is an unadjusted corporate action gap-down!
@@ -837,9 +858,18 @@ class LivePortfolioManager:
             queued = list(self.state.pending_entries)
             self.state.pending_entries = []
             if queued:
-                eq_open = cash_avail_at_open + sum(
-                    float(p_["shares"]) * float(bars_latest.loc[s_]["open"]) if s_ in bars_latest.index else float(p_["invested_capital"])
-                    for s_, p_ in self.state.active_positions.items()
+                entitlements_mtm = sum(
+                    float(e.get("market_value", e.get("allocated_capital", 0.0)))
+                    for e in self.state.corporate_action_entitlements
+                    if e.get("status") != "Settled"
+                )
+                eq_open = (
+                    cash_avail_at_open
+                    + sum(
+                        float(p_["shares"]) * float(bars_latest.loc[s_]["open"]) if s_ in bars_latest.index else float(p_["invested_capital"])
+                        for s_, p_ in self.state.active_positions.items()
+                    )
+                    + entitlements_mtm
                 )
                 slot_cap = eq_open / self.max_slots
                 free_slots = min(slots_avail_at_open, max(0, self.max_slots - len(self.state.active_positions)))
@@ -860,8 +890,28 @@ class LivePortfolioManager:
                         if age <= 5:
                             self.state.pending_entries.append(q)
                         continue
-                    if float(b["high"]) == float(b["low"]):  # upper-circuit lock: cannot buy
-                        actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at circuit, no entry")
+
+                    # Upper circuit ceiling rejection at open (cannot buy into zero-seller lockup)
+                    open_p = float(b["open"])
+                    high_p = float(b["high"])
+                    low_p = float(b["low"])
+                    prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else open_p
+                    circuit_limit = float(b.get("circuit_limit_pct", 0.0))
+                    rise_from_prev = (open_p / prev_c - 1.0) if (prev_c > 0) else 0.0
+
+                    if circuit_limit > 0:
+                        is_ceiling_lock = (open_p == high_p and open_p >= prev_c * (1.0 + circuit_limit - 1e-4))
+                    else:
+                        is_std_upper = any(abs(rise_from_prev - band) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
+                        is_ceiling_lock = (open_p == high_p and (is_std_upper or rise_from_prev >= 0.045))
+
+                    is_upper_circuit = bool(
+                        b.get("is_upper_circuit", False)
+                        or (high_p == low_p and open_p > prev_c)
+                        or is_ceiling_lock
+                    )
+                    if is_upper_circuit:
+                        actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at upper circuit ceiling at open, no entry")
                         continue
                     raw_entry = float(b["open"])
                     t1_alloc = min(cash_avail_at_open, slot_cap * 0.5, _liq_cap(b))
