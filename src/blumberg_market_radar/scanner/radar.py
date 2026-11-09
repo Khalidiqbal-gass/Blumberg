@@ -427,17 +427,24 @@ def apply_sector_cluster_guardrail(
             )
         )
         if status_col:
+            terminal_pattern = r"STOP_LOSS|STOPPED_OUT|DROPPED|EXIT|QUARANTINE_TIMEOUT|TARGET_MET|EXPIRED|CLOSED|CANCELLED|REJECTED"
             active_rows = active_pipeline_df[
-                ~active_pipeline_df[status_col].astype(str).str.contains("STOP_LOSS|DROPPED|EXIT|QUARANTINE_TIMEOUT", case=False, na=False)
+                ~active_pipeline_df[status_col].astype(str).str.contains(terminal_pattern, case=False, na=False)
             ]
         else:
             active_rows = active_pipeline_df
 
+        seen_active: set[str] = set()
         for _, r in active_rows.iterrows():
-            sec = str(r.get("sector") or "Diversified / General").strip()
             sym = str(r.get("symbol") or "").strip().upper()
-            if sym:
-                active_symbols.add(sym)
+            if not sym or sym in seen_active:
+                continue
+            seen_active.add(sym)
+            active_symbols.add(sym)
+            sec_val = r.get("sector")
+            sec = str(sec_val).strip().title() if (sec_val is not None and pd.notna(sec_val)) else "Diversified / General"
+            if _is_unclassified_sector(sec):
+                sec = "Diversified / General"
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
     total_active = len(active_symbols)

@@ -724,6 +724,12 @@ def fetch_historical_ohlcv(
                     continue
 
                 sub_df = sub_df.reset_index()
+                if isinstance(sub_df.columns, pd.MultiIndex):
+                    sub_df.columns = [
+                        c[0] if str(c[0]).lower() in ("open", "high", "low", "close", "volume", "date")
+                        else (c[1] if str(c[1]).lower() in ("open", "high", "low", "close", "volume", "date") else str(c[0]))
+                        for c in sub_df.columns
+                    ]
                 sub_df.columns = [str(c).lower().replace(" ", "_") for c in sub_df.columns]
 
                 date_col = "date" if "date" in sub_df.columns else sub_df.columns[0]
@@ -829,6 +835,7 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             logger.warning(f"Angel One benchmark fetch failed: {e}. Falling back to default.")
 
     try:
+        cache_file = Path("data/cache/benchmark_nifty50.parquet")
         raw = yf.download(
             tickers=BENCHMARK_SYMBOL,
             period=period,
@@ -837,6 +844,12 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             progress=False,
         ).reset_index()
 
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [
+                c[0] if str(c[0]).lower() in ("open", "high", "low", "close", "volume", "date")
+                else (c[1] if str(c[1]).lower() in ("open", "high", "low", "close", "volume", "date") else str(c[0]))
+                for c in raw.columns
+            ]
         raw.columns = [str(c).lower().replace(" ", "_") for c in raw.columns]
         date_col = "date" if "date" in raw.columns else raw.columns[0]
         bench = pd.DataFrame({
@@ -848,9 +861,24 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             "close": pd.to_numeric(raw["close"], errors="coerce"),
             "volume": pd.to_numeric(raw["volume"], errors="coerce"),
         }).dropna()
-        return validate_ohlcv(bench, clean_glitches=True)
+        validated = validate_ohlcv(bench, clean_glitches=True)
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            validated.to_parquet(cache_file, index=False)
+        except Exception as cw_err:
+            logger.debug(f"Could not update benchmark cache: {cw_err}")
+        return validated
     except Exception as exc:
-        logger.error(f"Benchmark fetch failed for {BENCHMARK_SYMBOL}: {exc}")
+        logger.warning(f"Live benchmark fetch failed for {BENCHMARK_SYMBOL}: {exc}. Attempting local cache fallback...")
+        cache_file = Path("data/cache/benchmark_nifty50.parquet")
+        if cache_file.exists():
+            try:
+                cached_df = pd.read_parquet(cache_file)
+                if not cached_df.empty and "close" in cached_df.columns:
+                    logger.info(f"Loaded {len(cached_df)} cached benchmark bars from {cache_file}")
+                    return validate_ohlcv(cached_df, clean_glitches=False)
+            except Exception as cr_err:
+                logger.error(f"Failed to read cached benchmark: {cr_err}")
         raise RuntimeError(
             f"Failed to fetch live benchmark data for {BENCHMARK_SYMBOL}: {exc}. "
             "Synthetic benchmark fallback is permanently disabled to prevent trading on fabricated data."

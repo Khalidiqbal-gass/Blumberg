@@ -199,9 +199,11 @@ def clean_transient_price_spikes(
     # - If volume is substantial, only an extreme impossible ratio (>10.0 or <0.10, e.g. CIPLA 12.5x drop) is repaired.
     # Real 2:1 or 3:1 splits with real traded volume are NOT rewritten here; they belong in corporate action detection.
     low_vol = (sorted_df["volume"] < 500) if has_vol else pd.Series(True, index=sorted_df.index)
+    # Only flat ticks with low volume (illiquid/bad tick) or extreme impossible ratios (>15.0 or <0.04) are repaired.
+    # True corporate actions (10:1 split = 0.10, 5:1 split = 0.20, 2:1 split = 0.50) with genuine volume >= 500 are preserved.
     flat_extreme_glitch = is_flat_tick & (
         (low_vol & ((ratio_close > spike_up_threshold) | (ratio_close < spike_down_threshold)))
-        | ((ratio_close > 10.0) | (ratio_close < 0.10))
+        | (low_vol & ((ratio_close > 10.0) | (ratio_close < 0.04)))
     )
 
     # 3. Intraday needle spikes (fat-finger tick where open and close are normal, but high or low spikes):

@@ -155,28 +155,49 @@ def evaluate_active_paper_signals(
         if sym_bars.empty:
             continue
 
-        fwd_bars = sym_bars[sym_bars["date"] >= sig_date]
+        fwd_bars = sym_bars[sym_bars["date"] >= sig_date].sort_values("date")
         if fwd_bars.empty:
             fwd_bars = sym_bars.tail(1)
 
-        peak_high = float(fwd_bars["high"].max())
-        trough_low = float(fwd_bars["low"].min())
-        curr_close = float(fwd_bars["close"].iloc[-1])
-        days_held = len(fwd_bars)
+        # Causal bar-by-bar chronological evaluation:
+        # A trade stopped out on Day 3 cannot resurrect into a TARGET_MET winner on Day 40.
+        peak_high = float(sig_price)
+        trough_low = float(sig_price)
+        status = "ACTIVE_TRACKING"
+        curr_close = float(sig_price)
+        pnl_pct = 0.0
+        days_held = 0
+
+        for _, bar_row in fwd_bars.iterrows():
+            days_held += 1
+            b_high = float(bar_row["high"])
+            b_low = float(bar_row["low"])
+            b_close = float(bar_row["close"])
+            curr_close = b_close
+
+            if b_high > peak_high:
+                peak_high = b_high
+            if b_low < trough_low:
+                trough_low = b_low
+
+            # Dynamic stop and target evaluation in exact chronological sequence
+            if b_low <= sig_price * 0.92:
+                status = "STOPPED_OUT"
+                pnl_pct = -8.0  # Stop execution price
+                break
+            elif b_high >= sig_price * 1.25:
+                status = "TARGET_MET (>+25%)"
+                pnl_pct = ((b_close / sig_price) - 1.0) * 100.0
+                break
+            elif days_held >= 60:
+                status = "EXPIRED_60D"
+                pnl_pct = ((b_close / sig_price) - 1.0) * 100.0
+                break
+            else:
+                pnl_pct = ((b_close / sig_price) - 1.0) * 100.0
 
         mfe_pct = ((peak_high / sig_price) - 1.0) * 100.0
         mae_pct = ((trough_low / sig_price) - 1.0) * 100.0
-        pnl_pct = ((curr_close / sig_price) - 1.0) * 100.0
-
-        # Status classification
-        if mfe_pct >= 25.0:
-            status = "TARGET_MET (>+25%)"
-        elif mae_pct <= -8.0 and mfe_pct < 10.0:
-            status = "STOPPED_OUT"
-        elif days_held >= 60:
-            status = "EXPIRED_60D"
-        else:
-            status = "ACTIVE_TRACKING"
 
         # Benchmark Alpha comparison
         alpha_pct = pnl_pct

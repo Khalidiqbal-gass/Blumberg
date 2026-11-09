@@ -330,6 +330,12 @@ class UpgradedVCPBacktestEngine:
                 cash += cash * daily_cash_yield
 
             # 0. Execute pending exits from previous session at TODAY'S OPEN
+            # Snapshot morning cash and available slots BEFORE executing morning exits
+            # Indian delivery equity rules require T+1 settlement; same-morning exit proceeds
+            # and freed slots cannot be recycled into new morning entry orders.
+            cash_avail_at_open = float(cash)
+            slots_avail_at_open = max(0, self.max_slots - len(active_trades))
+
             if self.exit_execution_mode == "NEXT_OPEN" and pending_exits:
                 rem_pending = {}
                 for psym, (p_reason, p_stg) in pending_exits.items():
@@ -341,11 +347,19 @@ class UpgradedVCPBacktestEngine:
                         continue
                     bar_open = s_df.loc[cur_date]
                     prev_p = bar_open.get("prev_close")
-                    is_lc_open = (
-                        bar_open["open"] == bar_open["low"]
-                        and bar_open["high"] == bar_open["low"]
-                        and pd.notnull(prev_p)
-                        and bar_open["close"] < prev_p
+                    open_p = float(bar_open["open"])
+                    low_p = float(bar_open["low"])
+                    prev_val = float(prev_p) if (prev_p is not None and pd.notnull(prev_p) and prev_p > 0) else open_p
+                    drop_from_prev = (open_p / prev_val - 1.0) if prev_val > 0 else 0.0
+                    circuit_limit = float(bar_open.get("circuit_limit_pct", 0.0)) if hasattr(bar_open, "get") else 0.0
+                    if circuit_limit > 0:
+                        is_floor_lock = (open_p == low_p and open_p <= prev_val * (1.0 - circuit_limit + 1e-4))
+                    else:
+                        is_std_lower = any(abs(drop_from_prev - (-band)) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
+                        is_floor_lock = (open_p == low_p and (is_std_lower or drop_from_prev <= -0.045))
+                    is_lc_open = bool(
+                        (bar_open["high"] == bar_open["low"] and pd.notnull(prev_p) and bar_open["close"] < prev_p)
+                        or is_floor_lock
                     )
                     if is_lc_open:
                         rem_pending[psym] = (p_reason, p_stg)
@@ -383,8 +397,8 @@ class UpgradedVCPBacktestEngine:
             # from yesterday's close. Exit proceeds from today's trades are NOT
             # yet available (T+1 cash settlement / prevents same-day cash recycling).
             existing_symbols = list(active_trades.keys())
-            available_cash_for_entry = cash
-            available_slots = max(0, self.max_slots - len(existing_symbols))
+            available_cash_for_entry = cash_avail_at_open
+            available_slots = min(slots_avail_at_open, max(0, self.max_slots - len(existing_symbols)))
 
             orig_idx = date_to_idx.get(cur_date, 0)
             prev_date = all_dates[orig_idx - 1] if orig_idx > 0 else None
@@ -541,7 +555,21 @@ class UpgradedVCPBacktestEngine:
                     # FIX #6a: Complete Circuit Rejection on Entry.
                     # Upper circuit: high == low (zero trading range, no sellers available).
                     # Includes the case open==high==low==close for truly locked stocks.
-                    if bar["high"] == bar["low"]:
+                    # Complete Circuit Rejection on Entry:
+                    # Reject flat days AND open ceiling locks (open == high >= prev_close * (1 + band))
+                    open_cand = float(bar["open"])
+                    high_cand = float(bar["high"])
+                    low_cand = float(bar["low"])
+                    prev_cand = float(bar.get("prev_close", open_cand)) if hasattr(bar, "get") and pd.notnull(bar.get("prev_close")) else open_cand
+                    rise_cand = (open_cand / prev_cand - 1.0) if prev_cand > 0 else 0.0
+                    c_limit = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
+                    if c_limit > 0:
+                        is_ceiling_cand = (open_cand == high_cand and open_cand >= prev_cand * (1.0 + c_limit - 1e-4))
+                    else:
+                        is_std_up = any(abs(rise_cand - b_band) <= 0.0025 for b_band in (0.02, 0.05, 0.10, 0.20))
+                        is_ceiling_cand = (open_cand == high_cand and (is_std_up or rise_cand >= 0.045))
+
+                    if (high_cand == low_cand) or is_ceiling_cand:
                         continue
 
                     # Sizing: Equal-Weight Slots (Zero Idle Cash) vs Risk Parity (Alpha Booster 1)
@@ -993,7 +1021,13 @@ class UpgradedVCPBacktestEngine:
 
         # Compounded CAGRs
         total_years = max(0.01, (sim_dates[-1] - sim_dates[0]).days / 365.25)
-        final_capital = eq_df.iloc[-1]["total_equity"] if not eq_df.empty else self.initial_capital
+        # Deduct terminal exit friction so final_capital reflects clean liquidated net proceeds
+        if not eq_df.empty:
+            last_cash = eq_df.iloc[-1]["cash"]
+            last_mtm = eq_df.iloc[-1]["mtm_positions"]
+            final_capital = last_cash + (last_mtm * (1.0 - self.cost_per_side))
+        else:
+            final_capital = self.initial_capital
         model_cagr = ((final_capital / self.initial_capital) ** (1.0 / total_years) - 1.0) * 100.0
 
         valid_nifty = eq_df.dropna(subset=["nifty_close"])

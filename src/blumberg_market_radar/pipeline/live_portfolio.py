@@ -621,7 +621,7 @@ class LivePortfolioManager:
             tr3 = (bars_proc["low"] - prev_close).abs()
             bars_proc["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             bars_proc["atr_14"] = bars_proc.groupby("symbol")["tr"].transform(
-                lambda s: s.rolling(14, min_periods=14).mean()
+                lambda s: s.rolling(14, min_periods=7).mean()
             )
 
         if "adv_20" not in bars_proc.columns and "volume" in bars_proc.columns:
@@ -863,15 +863,17 @@ class LivePortfolioManager:
                     for e in self.state.corporate_action_entitlements
                     if e.get("status") != "Settled"
                 )
-                eq_open = (
-                    cash_avail_at_open
+                # Target slot cap is sized against true total portfolio ledger equity at open.
+                # Cash spent on new orders remains strictly capped to cash_avail_at_open (T+1 freeze).
+                total_ledger_equity_at_open = (
+                    max(0.0, float(self.state.cash))
                     + sum(
                         float(p_["shares"]) * float(bars_latest.loc[s_]["open"]) if s_ in bars_latest.index else float(p_["invested_capital"])
                         for s_, p_ in self.state.active_positions.items()
                     )
                     + entitlements_mtm
                 )
-                slot_cap = eq_open / self.max_slots
+                slot_cap = total_ledger_equity_at_open / self.max_slots
                 free_slots = min(slots_avail_at_open, max(0, self.max_slots - len(self.state.active_positions)))
                 for q in queued:
                     qsym = q["symbol"]
@@ -923,7 +925,7 @@ class LivePortfolioManager:
                     pos_obj = LiveTradePosition(
                         symbol=qsym, entry_date=today_date, shares=t1_shares, invested_capital=t1_alloc,
                         entry_price=raw_entry, entry_price_with_friction=raw_entry * (1.0 + self.cost_per_side),
-                        current_price=raw_entry, peak_price=max(raw_entry, float(b["high"])),
+                        current_price=raw_entry, peak_price=raw_entry,
                         current_gain_pct=0.0, peak_gain_pct=0.0, unrealized_pnl_rs=0.0,
                         target_slot_capital=slot_cap, tranche1_shares=t1_shares, tranche1_price=raw_entry,
                         current_stage="Stage 1: Ignition Defense", stop_loss_price=raw_entry * 0.92,
@@ -1189,6 +1191,17 @@ class LivePortfolioManager:
             self.state.closed_trades.append(asdict(closed_rec))
             del self.state.active_positions[sym]
             actions_taken.append(f"🔴 SELL: {sym} exited at ₹{exit_p:.2f} ({net_ret:+.1f}%) | Reason: {reason}")
+
+        # Update peak price for newly entered positions that survived today's session (causal EOD update)
+        for sym in fills_today:
+            if sym in self.state.active_positions:
+                b_sym = _bar_today(sym)
+                if b_sym is not None:
+                    h_sym = float(b_sym["high"])
+                    p_rec = self.state.active_positions[sym]
+                    if h_sym > p_rec["peak_price"]:
+                        p_rec["peak_price"] = h_sym
+                        p_rec["peak_gain_pct"] = (h_sym / p_rec["entry_price"] - 1.0) * 100.0
 
         # Step C: Queue new signals. They are FILLED at tomorrow's open (never at the signal-day close,
         # which is unattainable and not what the backtest assumes).

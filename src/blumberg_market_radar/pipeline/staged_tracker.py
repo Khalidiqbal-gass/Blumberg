@@ -74,7 +74,8 @@ def classify_layer_by_growth(
        - Peak MFE >= 25%: RALLY_LEADER (🔥 +25%+ Expansion)
     """
     # 1. Stop-Loss Trigger
-    if max_mae_pct <= stop_loss_pct and current_gain_pct <= 0.0:
+    # Stop loss is an absorbing barrier: once triggered, position cannot get trapped in stagnant state
+    if max_mae_pct <= stop_loss_pct:
         return current_layer, "STOP_LOSS_DROPPED (⚠️ -8% Hit)"
 
     # 2. Layer 1 Evaluation
@@ -413,7 +414,7 @@ def update_pipeline_with_bars(
         worst_mae = min((low_water / base_price - 1.0) * 100.0, r.max_mae_pct)
 
         # Growth-based layer and status assignment (Terminal status preservation)
-        if any(k in r.status.upper() for k in ('STOP_LOSS', 'DROPPED')):
+        if any(k in r.status.upper() for k in ('STOP_LOSS', 'STOPPED_OUT', 'DROPPED', 'TARGET_MET', 'EXPIRED', 'CLOSED')):
             current_layer = r.current_layer
             status = r.status
         else:
