@@ -390,6 +390,19 @@ def _is_unclassified_sector(sec: str) -> bool:
     return sec.strip().upper() in _UNCLASSIFIED_SECTORS
 
 
+def _normalize_sector(sec_val: object) -> str:
+    if sec_val is None:
+        return "Diversified / General"
+    s = str(sec_val).strip()
+    if not s or _is_unclassified_sector(s):
+        return "Diversified / General"
+    acronyms = {"IT", "PSU", "FMCG", "NBFC", "BFSI", "EMS", "API", "CDMO", "EV", "AI"}
+    upper_s = s.upper()
+    if upper_s in acronyms:
+        return upper_s
+    return s.title()
+
+
 def apply_sector_cluster_guardrail(
     ranked_candidates: pd.DataFrame,
     active_pipeline_df: pd.DataFrame | None = None,
@@ -443,14 +456,14 @@ def apply_sector_cluster_guardrail(
                 continue
             seen_active.add(sym)
             active_symbols.add(sym)
-            sec_val = r.get("sector")
-            sec = str(sec_val).strip().title() if (sec_val is not None and pd.notna(sec_val)) else "Diversified / General"
-            if _is_unclassified_sector(sec):
-                sec = "Diversified / General"
-            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            sec = _normalize_sector(r.get("sector"))
+            if not _is_unclassified_sector(sec):
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
 
     total_active = len(active_symbols)
     available_slots = max(0, max_portfolio_slots - total_active)
+    if available_slots <= 0:
+        return pd.DataFrame(), sector_counts, 0
 
     approved_records: list[dict] = []
     for _, row in ranked_candidates.iterrows():
@@ -458,13 +471,16 @@ def apply_sector_cluster_guardrail(
         if sym in active_symbols:
             continue  # Already active in portfolio
 
-        sec = str(row.get("sector") or "Diversified / General").strip()
+        sec = _normalize_sector(row.get("sector"))
         current_count = sector_counts.get(sec, 0)
 
         # Enforce maximum 5 stocks per sector (25% exposure); unclassified sectors are exempt
         if _is_unclassified_sector(sec) or current_count < max_stocks_per_sector:
-            approved_records.append(dict(row))
-            sector_counts[sec] = current_count + 1
+            row_dict = dict(row)
+            row_dict["sector"] = sec
+            approved_records.append(row_dict)
+            if not _is_unclassified_sector(sec):
+                sector_counts[sec] = current_count + 1
             active_symbols.add(sym)
             if len(approved_records) >= available_slots:
                 break

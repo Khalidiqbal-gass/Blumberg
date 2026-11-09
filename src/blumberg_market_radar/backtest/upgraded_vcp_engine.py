@@ -93,6 +93,8 @@ class BacktestSummary:
     use_vol_parity: bool = True
     use_sector_leadership: bool = False
     benchmark_cagr_pct: float = 0.0
+    active_holdings: pd.DataFrame = field(default_factory=pd.DataFrame)
+    realized_trades: int = 0
 
 
 class UpgradedVCPBacktestEngine:
@@ -351,17 +353,19 @@ class UpgradedVCPBacktestEngine:
                     low_p = float(bar_open["low"])
                     prev_val = float(prev_p) if (prev_p is not None and pd.notnull(prev_p) and prev_p > 0) else open_p
                     drop_from_prev = (1.0 - open_p / prev_val) if prev_val > 0 else 0.0
-                    circuit_limit = float(bar_open.get("circuit_limit_pct", 0.0)) if hasattr(bar_open, "get") else 0.0
-                    if circuit_limit > 0:
-                        is_floor_lock = (open_p == low_p and open_p <= prev_val * (1.0 - circuit_limit + 1e-4))
+                    open_tradable = bar_open.get("open_tradable") if hasattr(bar_open, "get") else None
+                    if open_tradable is False:
+                        is_lc_open = True
+                    elif open_tradable is True:
+                        is_lc_open = False
                     else:
-                        is_std_lower = any(abs(drop_from_prev - band) <= 0.005 for band in (0.02, 0.05, 0.10, 0.20))
-                        is_floor_lock = (open_p == low_p and (is_std_lower or drop_from_prev >= 0.045))
-                    is_lc_open = bool(
-                        bar_open.get("is_lower_circuit", False)
-                        or is_floor_lock
-                        or (bar_open["high"] == bar_open["low"] and pd.notnull(prev_p) and bar_open["close"] < prev_p)
-                    )
+                        circuit_limit = float(bar_open.get("circuit_limit_pct", 0.0)) if hasattr(bar_open, "get") else 0.0
+                        if circuit_limit > 0:
+                            is_floor_lock = (open_p <= prev_val * (1.0 - circuit_limit + 1e-4))
+                        else:
+                            is_std_lower = any(abs(drop_from_prev - band) <= 0.005 for band in (0.02, 0.05, 0.10, 0.20))
+                            is_floor_lock = (open_p == low_p and (is_std_lower or drop_from_prev >= 0.045))
+                        is_lc_open = bool((bar_open.get("is_lower_circuit", False) if hasattr(bar_open, "get") else False) or is_floor_lock)
                     if is_lc_open:
                         rem_pending[psym] = (p_reason, p_stg)
                         continue
@@ -428,7 +432,6 @@ class UpgradedVCPBacktestEngine:
                 for sym in existing_symbols:
                     tr = active_trades[sym]
                     if tr.tranche2_eligible and not tr.tranche2_active:
-                        tr.tranche2_eligible = False
                         s_df = symbol_data[sym]
                         if cur_date in s_df.index:
                             bar = s_df.loc[cur_date]
@@ -436,14 +439,23 @@ class UpgradedVCPBacktestEngine:
                             open_t2 = float(bar["open"])
                             prev_t2 = float(bar.get("prev_close", open_t2)) if hasattr(bar, "get") and pd.notnull(bar.get("prev_close")) else open_t2
                             rise_t2 = (open_t2 / prev_t2 - 1.0) if prev_t2 > 0 else 0.0
-                            c_limit_t2 = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
-                            if c_limit_t2 > 0:
-                                is_t2_ceiling = (open_t2 >= prev_t2 * (1.0 + c_limit_t2 - 1e-4))
+                            t2_tradable = bar.get("open_tradable") if hasattr(bar, "get") else None
+                            if t2_tradable is False:
+                                is_upper_circuit_t2 = True
+                            elif t2_tradable is True:
+                                is_upper_circuit_t2 = False
                             else:
-                                is_t2_ceiling = any(abs(rise_t2 - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
-                            is_upper_circuit_t2 = bool(bar.get("is_upper_circuit", False) or is_t2_ceiling)
+                                c_limit_t2 = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
+                                if c_limit_t2 > 0:
+                                    is_t2_ceiling = (open_t2 >= prev_t2 * (1.0 + c_limit_t2 - 1e-4))
+                                else:
+                                    is_t2_ceiling = any(abs(rise_t2 - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
+                                is_upper_circuit_t2 = bool((bar.get("is_upper_circuit", False) if hasattr(bar, "get") else False) or is_t2_ceiling)
 
-                            if not is_upper_circuit_t2:
+                            if is_upper_circuit_t2:
+                                tr.tranche2_eligible = True  # Survives deferral to try next session
+                            else:
+                                tr.tranche2_eligible = False
                                 t2_alloc = min(available_cash_for_entry, tr.target_slot_capital * 0.5, self._liquidity_cap(bar))
                                 if t2_alloc >= 2500.0:
                                     raw_t2 = bar["open"]
@@ -1048,18 +1060,24 @@ class UpgradedVCPBacktestEngine:
             nifty_end = 1.0
             nifty_cagr = 0.0
 
-        # Trade metrics
+        # Trade metrics: separate closed realized trades from still-open active terminal positions
+        closed_trades_df = trades_df[trades_df["status"] != "Active"] if not trades_df.empty else pd.DataFrame()
+        active_holdings_df = trades_df[trades_df["status"] == "Active"] if not trades_df.empty else pd.DataFrame()
         total_trades = len(trades_df)
-        winning_trades = trades_df[trades_df["net_return_pct"] > 0]
-        losing_trades = trades_df[trades_df["net_return_pct"] <= 0]
+        realized_trade_count = len(closed_trades_df)
 
-        win_rate = (len(winning_trades) / total_trades * 100.0) if total_trades > 0 else 0.0
+        calc_df = closed_trades_df if realized_trade_count > 0 else trades_df
+        calc_total = len(calc_df)
+        winning_trades = calc_df[calc_df["net_return_pct"] > 0] if calc_total > 0 else pd.DataFrame()
+        losing_trades = calc_df[calc_df["net_return_pct"] <= 0] if calc_total > 0 else pd.DataFrame()
+
+        win_rate = (len(winning_trades) / calc_total * 100.0) if calc_total > 0 else 0.0
         avg_gain = winning_trades["net_return_pct"].mean() if len(winning_trades) > 0 else 0.0
         avg_loss = abs(losing_trades["net_return_pct"].mean()) if len(losing_trades) > 0 else 0.0
         win_loss_ratio = (avg_gain / avg_loss) if avg_loss > 0 else 999.0
 
-        gross_profits = winning_trades["pnl_amount"].sum()
-        gross_losses = abs(losing_trades["pnl_amount"].sum())
+        gross_profits = winning_trades["pnl_amount"].sum() if len(winning_trades) > 0 else 0.0
+        gross_losses = abs(losing_trades["pnl_amount"].sum()) if len(losing_trades) > 0 else 0.0
         profit_factor = (gross_profits / gross_losses) if gross_losses > 0 else 999.0
 
         # Mathematical Expectancy = (Win% * AvgWin) - (Loss% * AvgLoss)
@@ -1067,8 +1085,8 @@ class UpgradedVCPBacktestEngine:
         loss_prob = 1.0 - win_prob
         expectancy = (win_prob * avg_gain) - (loss_prob * avg_loss)
 
-        avg_bars = trades_df["bars_held"].mean() if total_trades > 0 else 0.0
-        avg_days = trades_df["calendar_days"].mean() if total_trades > 0 else 0.0
+        avg_bars = calc_df["bars_held"].mean() if calc_total > 0 else 0.0
+        avg_days = calc_df["calendar_days"].mean() if calc_total > 0 else 0.0
 
         # Year-by-Year Table
         eq_df["year"] = eq_df["date"].dt.year
@@ -1123,4 +1141,6 @@ class UpgradedVCPBacktestEngine:
             use_vol_parity=self.use_vol_parity,
             use_sector_leadership=self.use_sector_leadership,
             benchmark_cagr_pct=nifty_cagr,
+            active_holdings=active_holdings_df,
+            realized_trades=realized_trade_count,
         )

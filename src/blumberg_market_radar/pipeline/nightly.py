@@ -157,7 +157,22 @@ def evaluate_active_paper_signals(
 
         fwd_bars = sym_bars[sym_bars["date"] >= sig_date].sort_values("date")
         if fwd_bars.empty:
-            fwd_bars = sym_bars.tail(1)
+            records.append({
+                "signal_id": sig_id,
+                "signal_date": sig_ts.strftime("%Y-%m-%d"),
+                "symbol": sym,
+                "price_at_signal": np.round(sig_price, 2),
+                "current_price": np.round(sig_price, 2),
+                "current_pnl_pct": 0.0,
+                "mfe_pct": 0.0,
+                "mae_pct": 0.0,
+                "days_held": 0,
+                "alpha_vs_nifty_pct": 0.0,
+                "status": "AWAITING_FORWARD_BARS",
+                "radar_score": float(row.get("radar_score", 0.0)),
+                "primary_reason": str(row.get("primary_reason", "Pre-Rally Setup")),
+            })
+            continue
 
         # Causal bar-by-bar chronological evaluation:
         # A trade stopped out on Day 3 cannot resurrect into a TARGET_MET winner on Day 40.
