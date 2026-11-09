@@ -350,16 +350,17 @@ class UpgradedVCPBacktestEngine:
                     open_p = float(bar_open["open"])
                     low_p = float(bar_open["low"])
                     prev_val = float(prev_p) if (prev_p is not None and pd.notnull(prev_p) and prev_p > 0) else open_p
-                    drop_from_prev = (open_p / prev_val - 1.0) if prev_val > 0 else 0.0
+                    drop_from_prev = (1.0 - open_p / prev_val) if prev_val > 0 else 0.0
                     circuit_limit = float(bar_open.get("circuit_limit_pct", 0.0)) if hasattr(bar_open, "get") else 0.0
                     if circuit_limit > 0:
                         is_floor_lock = (open_p == low_p and open_p <= prev_val * (1.0 - circuit_limit + 1e-4))
                     else:
-                        is_std_lower = any(abs(drop_from_prev - (-band)) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
-                        is_floor_lock = (open_p == low_p and (is_std_lower or drop_from_prev <= -0.045))
+                        is_std_lower = any(abs(drop_from_prev - band) <= 0.005 for band in (0.02, 0.05, 0.10, 0.20))
+                        is_floor_lock = (open_p == low_p and (is_std_lower or drop_from_prev >= 0.045))
                     is_lc_open = bool(
-                        (bar_open["high"] == bar_open["low"] and pd.notnull(prev_p) and bar_open["close"] < prev_p)
+                        bar_open.get("is_lower_circuit", False)
                         or is_floor_lock
+                        or (bar_open["high"] == bar_open["low"] and pd.notnull(prev_p) and bar_open["close"] < prev_p)
                     )
                     if is_lc_open:
                         rem_pending[psym] = (p_reason, p_stg)
@@ -431,8 +432,18 @@ class UpgradedVCPBacktestEngine:
                         s_df = symbol_data[sym]
                         if cur_date in s_df.index:
                             bar = s_df.loc[cur_date]
-                            # FIX #6a: Complete upper circuit check (high == low = zero range)
-                            if not (bar["high"] == bar["low"]):
+                            # Causal open upper-circuit ceiling check at 9:15 AM open
+                            open_t2 = float(bar["open"])
+                            prev_t2 = float(bar.get("prev_close", open_t2)) if hasattr(bar, "get") and pd.notnull(bar.get("prev_close")) else open_t2
+                            rise_t2 = (open_t2 / prev_t2 - 1.0) if prev_t2 > 0 else 0.0
+                            c_limit_t2 = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
+                            if c_limit_t2 > 0:
+                                is_t2_ceiling = (open_t2 >= prev_t2 * (1.0 + c_limit_t2 - 1e-4))
+                            else:
+                                is_t2_ceiling = any(abs(rise_t2 - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
+                            is_upper_circuit_t2 = bool(bar.get("is_upper_circuit", False) or is_t2_ceiling)
+
+                            if not is_upper_circuit_t2:
                                 t2_alloc = min(available_cash_for_entry, tr.target_slot_capital * 0.5, self._liquidity_cap(bar))
                                 if t2_alloc >= 2500.0:
                                     raw_t2 = bar["open"]
@@ -555,21 +566,18 @@ class UpgradedVCPBacktestEngine:
                     # FIX #6a: Complete Circuit Rejection on Entry.
                     # Upper circuit: high == low (zero trading range, no sellers available).
                     # Includes the case open==high==low==close for truly locked stocks.
-                    # Complete Circuit Rejection on Entry:
-                    # Reject flat days AND open ceiling locks (open == high >= prev_close * (1 + band))
+                    # Complete Circuit Rejection on Entry: strictly causal at 9:15 AM open
                     open_cand = float(bar["open"])
-                    high_cand = float(bar["high"])
-                    low_cand = float(bar["low"])
                     prev_cand = float(bar.get("prev_close", open_cand)) if hasattr(bar, "get") and pd.notnull(bar.get("prev_close")) else open_cand
                     rise_cand = (open_cand / prev_cand - 1.0) if prev_cand > 0 else 0.0
                     c_limit = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
                     if c_limit > 0:
-                        is_ceiling_cand = (open_cand == high_cand and open_cand >= prev_cand * (1.0 + c_limit - 1e-4))
+                        is_ceiling_cand = (open_cand >= prev_cand * (1.0 + c_limit - 1e-4))
                     else:
-                        is_std_up = any(abs(rise_cand - b_band) <= 0.0025 for b_band in (0.02, 0.05, 0.10, 0.20))
-                        is_ceiling_cand = (open_cand == high_cand and (is_std_up or rise_cand >= 0.045))
+                        is_std_up = any(abs(rise_cand - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
+                        is_ceiling_cand = is_std_up
 
-                    if (high_cand == low_cand) or is_ceiling_cand:
+                    if bool(bar.get("is_upper_circuit", False) or is_ceiling_cand):
                         continue
 
                     # Sizing: Equal-Weight Slots (Zero Idle Cash) vs Risk Parity (Alpha Booster 1)

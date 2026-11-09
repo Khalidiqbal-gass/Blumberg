@@ -426,11 +426,13 @@ def apply_sector_cluster_guardrail(
                 else ("current_stage" if "current_stage" in active_pipeline_df.columns else None)
             )
         )
-        if status_col:
-            terminal_pattern = r"STOP_LOSS|STOPPED_OUT|DROPPED|EXIT|QUARANTINE_TIMEOUT|TARGET_MET|EXPIRED|CLOSED|CANCELLED|REJECTED"
-            active_rows = active_pipeline_df[
-                ~active_pipeline_df[status_col].astype(str).str.contains(terminal_pattern, case=False, na=False)
-            ]
+        terminal_pattern = r"STOP_LOSS|STOPPED_OUT|DROPPED|EXIT|QUARANTINE_TIMEOUT|TARGET_MET|EXPIRED|CLOSED|CANCELLED|REJECTED"
+        potential_cols = [c for c in ("status", "current_layer", "current_stage") if c in active_pipeline_df.columns]
+        if potential_cols:
+            is_terminal = pd.Series(False, index=active_pipeline_df.index)
+            for c in potential_cols:
+                is_terminal = is_terminal | active_pipeline_df[c].astype(str).str.contains(terminal_pattern, case=False, na=False)
+            active_rows = active_pipeline_df[~is_terminal]
         else:
             active_rows = active_pipeline_df
 

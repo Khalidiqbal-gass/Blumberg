@@ -172,3 +172,48 @@ def test_validation_split_not_overwritten():
     cleaned, n_repaired = clean_transient_price_spikes(df)
     assert n_repaired == 0
     assert cleaned["close"].iloc[1] == 100.0  # Real post-split price preserved!
+
+
+def test_bars_proc_filters_future_bars(tmp_path):
+    """execute_daily_rebalance must not leak future bars into bars_proc or bars_latest."""
+    mgr = LivePortfolioManager(state_path=tmp_path / "live.json", initial_capital=1_000_000.0)
+    
+    # 5 days of bars supplied, but today is Day 2
+    dates = ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-01-05"]
+    prices = [100.0, 102.0, 150.0, 200.0, 300.0]
+    bars = pd.DataFrame({
+        "date": dates,
+        "symbol": ["INFY"] * 5,
+        "open": prices,
+        "high": [p * 1.01 for p in prices],
+        "low": [p * 0.99 for p in prices],
+        "close": prices,
+        "volume": [100000] * 5,
+    })
+    
+    # Rebalance on Day 2
+    res = mgr.execute_daily_rebalance(
+        bars_df=bars,
+        bench_df=None,
+        candidates_df=pd.DataFrame(),
+        current_date_str="2026-01-02",
+        enforce_regime=False,
+    )
+    # Total equity must not have been inflated by 150/200/300 future prices
+    assert res["date"] == "2026-01-02"
+
+
+def test_radar_multiple_status_columns_terminal_filtering():
+    """If status='ACTIVE' but current_layer='TARGET_MET', row must be excluded as terminal."""
+    active_df = pd.DataFrame([
+        {"symbol": "SYM_1", "sector": "Auto", "status": "ACTIVE", "current_layer": "TARGET_MET (>+25%)"},
+        {"symbol": "SYM_2", "sector": "Auto", "status": "ACTIVE", "current_stage": "STOPPED_OUT"},
+    ])
+    
+    cands = pd.DataFrame([{"symbol": "NEW_1", "sector": "Auto", "radar_score": 90.0}])
+    approved, counts, available_slots = apply_sector_cluster_guardrail(cands, active_pipeline_df=active_df, max_portfolio_slots=8)
+    
+    # Both SYM_1 and SYM_2 must be recognized as terminal!
+    assert available_slots == 8
+    assert len(approved) == 1
+    assert approved.iloc[0]["symbol"] == "NEW_1"

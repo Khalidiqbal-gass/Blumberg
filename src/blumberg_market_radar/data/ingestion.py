@@ -861,7 +861,11 @@ def fetch_benchmark(period: str = "2y", data_source: str = "yfinance", **kwargs)
             "close": pd.to_numeric(raw["close"], errors="coerce"),
             "volume": pd.to_numeric(raw["volume"], errors="coerce"),
         }).dropna()
+        if bench.empty:
+            raise ValueError(f"Live benchmark fetch returned 0 rows for {BENCHMARK_SYMBOL}")
         validated = validate_ohlcv(bench, clean_glitches=True)
+        if validated.empty:
+            raise ValueError(f"Validated benchmark DataFrame is empty for {BENCHMARK_SYMBOL}")
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             validated.to_parquet(cache_file, index=False)

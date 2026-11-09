@@ -613,7 +613,12 @@ class LivePortfolioManager:
             self.state.cash += daily_yield_rs
 
         # Ensure 14-day True Range ATR is computed across historical bars for accurate dynamic stops
-        bars_proc = bars_df.sort_values(["symbol", "date"]).copy()
+        # Strictly causal: filter bars up to today_date to prevent future bars leaking into bars_latest or MTM
+        bars_df_causal = bars_df.copy()
+        if "date" in bars_df_causal.columns:
+            bars_df_causal["_date_str"] = pd.to_datetime(bars_df_causal["date"]).dt.strftime("%Y-%m-%d")
+            bars_df_causal = bars_df_causal[bars_df_causal["_date_str"] <= today_date].drop(columns=["_date_str"])
+        bars_proc = bars_df_causal.sort_values(["symbol", "date"]).copy()
         if "atr_14" not in bars_proc.columns and "high" in bars_proc.columns and "low" in bars_proc.columns:
             prev_close = bars_proc.groupby("symbol")["close"].shift(1)
             tr1 = bars_proc["high"] - bars_proc["low"]
@@ -745,7 +750,7 @@ class LivePortfolioManager:
                     if circuit_limit > 0:
                         is_floor_lock = (open_p == low_p and open_p <= prev_c * (1.0 - circuit_limit + 1e-4))
                     else:
-                        is_standard_band = any(abs(drop_from_prev - band) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
+                        is_standard_band = any(abs(drop_from_prev - band) <= 0.005 for band in (0.02, 0.05, 0.10, 0.20))
                         is_floor_lock = (open_p == low_p and (is_standard_band or drop_from_prev >= 0.045))
 
                     is_lower_circuit = bool(
