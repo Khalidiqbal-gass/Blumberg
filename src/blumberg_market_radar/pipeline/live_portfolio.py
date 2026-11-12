@@ -141,13 +141,22 @@ class LivePortfolioManager:
                 if not isinstance(data, dict):
                     raise ValueError(f"State root must be a dict, got {type(data).__name__}")
 
-                for req_key in ("cash", "active_positions", "closed_trades"):
+                if "schema_version" not in data:
+                    raise ValueError("State root missing required key 'schema_version'")
+
+                version = data["schema_version"]
+                if not isinstance(version, int) or version != 1:
+                    raise ValueError(f"Unsupported schema_version {version!r}")
+
+                REQUIRED_LEDGER_KEYS = (
+                    "initial_capital", "cash", "active_positions", "closed_trades",
+                    "daily_equity_history", "pending_entries", "pending_exits",
+                    "corporate_action_entitlements", "resolved_corporate_action_events",
+                    "last_rebalance_date", "created_at"
+                )
+                for req_key in REQUIRED_LEDGER_KEYS:
                     if req_key not in data:
                         raise ValueError(f"State root missing required key {req_key!r}")
-
-                version = data.get("schema_version", 1)
-                if not isinstance(version, int) or version > 1:
-                    raise ValueError(f"Unsupported schema_version {version!r}")
 
                 # Schema validation for all persisted list fields and nested item structures
                 for list_field in (
@@ -476,8 +485,14 @@ class LivePortfolioManager:
         if event_id is None and parent_symbol is None:
             raise ValueError("Must provide either event_id or parent_symbol to settle corporate action entitlement.")
 
-        if realized_cash is None or not (isinstance(realized_cash, (int, float)) and np.isfinite(realized_cash) and realized_cash >= 0.0):
-            raise ValueError(f"realized_cash must be an explicit, finite non-negative number, got {realized_cash!r}")
+        if (
+            realized_cash is None
+            or isinstance(realized_cash, bool)
+            or not isinstance(realized_cash, (int, float))
+            or not np.isfinite(realized_cash)
+            or realized_cash < 0.0
+        ):
+            raise ValueError(f"realized_cash must be an explicit, finite non-negative number (got {realized_cash!r})")
 
         matched = []
         if event_id:
@@ -747,7 +762,8 @@ class LivePortfolioManager:
                     low_p = float(b["low"])
                     high_p = float(b["high"])
                     close_p = float(b["close"])
-                    prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else float(pos.get("current_price", open_p))
+                    has_prev_c = "prev_close" in b and pd.notna(b["prev_close"])
+                    prev_c = float(b["prev_close"]) if has_prev_c else open_p
                     
                     # Lower circuit check at open:
                     # An exit order cannot execute if stock is locked limit-down without liquidity at market open.
@@ -759,6 +775,8 @@ class LivePortfolioManager:
                         is_lower_circuit = True
                     elif open_tradable is True:
                         is_lower_circuit = False
+                    elif not has_prev_c:
+                        is_lower_circuit = False
                     else:
                         circuit_limit = float(b.get("circuit_limit_pct", 0.0))
                         drop_from_prev = (1.0 - open_p / prev_c) if (prev_c is not None and prev_c > 0) else 0.0
@@ -766,8 +784,8 @@ class LivePortfolioManager:
                             is_floor_lock = (open_p <= prev_c * (1.0 - circuit_limit + 1e-4))
                         else:
                             is_standard_band = any(abs(drop_from_prev - band) <= 0.005 for band in (0.02, 0.05, 0.10, 0.20))
-                            is_floor_lock = (open_p == low_p and (is_standard_band or drop_from_prev >= 0.045))
-                        is_lower_circuit = bool(b.get("is_lower_circuit", False) or is_floor_lock)
+                            is_floor_lock = (is_standard_band or drop_from_prev >= 0.045)
+                        is_lower_circuit = is_floor_lock
 
                     if is_lower_circuit:
                         pe["attempt_count"] = pe.get("attempt_count", 0) + 1
@@ -812,18 +830,18 @@ class LivePortfolioManager:
                 if pos.get("is_quarantined", False):
                     continue
                 if pos.get("tranche2_eligible") and not pos.get("tranche2_active", False):
-                    pos["tranche2_eligible"] = False
                     b = _bar_today(sym)
                     if b is None:
                         continue
                     t2_open_p = float(b["open"])
-                    t2_high_p = float(b["high"])
-                    t2_low_p = float(b["low"])
-                    t2_prev_c = float(b["prev_close"]) if "prev_close" in b and pd.notna(b["prev_close"]) else float(pos.get("current_price", t2_open_p))
+                    t2_has_prev_c = "prev_close" in b and pd.notna(b["prev_close"])
+                    t2_prev_c = float(b["prev_close"]) if t2_has_prev_c else t2_open_p
                     t2_tradable = b.get("open_tradable")
                     if t2_tradable is False:
                         is_t2_upper_circuit = True
                     elif t2_tradable is True:
+                        is_t2_upper_circuit = False
+                    elif not t2_has_prev_c:
                         is_t2_upper_circuit = False
                     else:
                         t2_circuit_limit = float(b.get("circuit_limit_pct", 0.0))
@@ -833,10 +851,12 @@ class LivePortfolioManager:
                         else:
                             is_t2_std_upper = any(abs(t2_rise_from_prev - band) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
                             is_t2_ceiling_lock = (is_t2_std_upper or t2_rise_from_prev >= 0.045)
-                        is_t2_upper_circuit = bool(b.get("is_upper_circuit", False) or is_t2_ceiling_lock)
+                        is_t2_upper_circuit = is_t2_ceiling_lock
                     if is_t2_upper_circuit:
+                        pos["tranche2_eligible"] = True  # Survives deferral to retry next liquid session
                         actions_taken.append(f"⚠️ TRANCHE 2 DEFERRED: {sym} locked at upper circuit ceiling at open (no sellers).")
                         continue
+                    pos["tranche2_eligible"] = False
 
                     # FIX: Detect if today's open is an unadjusted corporate action gap-down!
                     if _is_corporate_action_anomaly(b, pos, at_open=True):
@@ -927,7 +947,7 @@ class LivePortfolioManager:
                         else:
                             is_std_upper = any(abs(rise_from_prev - band) <= 0.0025 for band in (0.02, 0.05, 0.10, 0.20))
                             is_ceiling_lock = (is_std_upper or rise_from_prev >= 0.045)
-                        is_upper_circuit = bool(b.get("is_upper_circuit", False) or is_ceiling_lock)
+                        is_upper_circuit = is_ceiling_lock
                     if is_upper_circuit:
                         actions_taken.append(f"⛔ ORDER REJECTED: {qsym} locked at upper circuit ceiling at open, no entry")
                         continue

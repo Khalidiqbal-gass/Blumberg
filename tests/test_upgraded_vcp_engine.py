@@ -146,11 +146,11 @@ def test_stage_5_parabolic_climax_exit():
     dates = pd.date_range("2023-01-01", periods=140, freq="B", tz="UTC")
     bench = _generate_synthetic_benchmark(dates, trend="bull")
 
-    # 40 bars base, explosive surge to 220 (> 60% above 100 EMA), then drops 16% to 184
+    # 40 bars base, explosive surge to 250 (> 60% above 100 EMA and doubling), then drops >25% trail to 180
     prices = (
         [100.0 + i * 0.1 for i in range(40)] +
-        [105.0, 115.0, 130.0, 160.0, 190.0, 220.0] +
-        [184.0] * 94
+        [105.0, 115.0, 140.0, 180.0, 220.0, 250.0] +
+        [180.0] * 94
     )
     vols = [500_000.0] * 40 + [3_000_000.0] * 6 + [500_000.0] * 94
     spreads = [0.04] * 25 + [0.01] * 115  # VCP contraction

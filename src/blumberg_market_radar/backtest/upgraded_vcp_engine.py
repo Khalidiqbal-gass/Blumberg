@@ -364,8 +364,8 @@ class UpgradedVCPBacktestEngine:
                             is_floor_lock = (open_p <= prev_val * (1.0 - circuit_limit + 1e-4))
                         else:
                             is_std_lower = any(abs(drop_from_prev - band) <= 0.005 for band in (0.02, 0.05, 0.10, 0.20))
-                            is_floor_lock = (open_p == low_p and (is_std_lower or drop_from_prev >= 0.045))
-                        is_lc_open = bool((bar_open.get("is_lower_circuit", False) if hasattr(bar_open, "get") else False) or is_floor_lock)
+                            is_floor_lock = (is_std_lower or drop_from_prev >= 0.045)
+                        is_lc_open = is_floor_lock
                     if is_lc_open:
                         rem_pending[psym] = (p_reason, p_stg)
                         continue
@@ -450,7 +450,7 @@ class UpgradedVCPBacktestEngine:
                                     is_t2_ceiling = (open_t2 >= prev_t2 * (1.0 + c_limit_t2 - 1e-4))
                                 else:
                                     is_t2_ceiling = any(abs(rise_t2 - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
-                                is_upper_circuit_t2 = bool((bar.get("is_upper_circuit", False) if hasattr(bar, "get") else False) or is_t2_ceiling)
+                                is_upper_circuit_t2 = is_t2_ceiling
 
                             if is_upper_circuit_t2:
                                 tr.tranche2_eligible = True  # Survives deferral to try next session
@@ -579,17 +579,24 @@ class UpgradedVCPBacktestEngine:
                     # Upper circuit: high == low (zero trading range, no sellers available).
                     # Includes the case open==high==low==close for truly locked stocks.
                     # Complete Circuit Rejection on Entry: strictly causal at 9:15 AM open
-                    open_cand = float(bar["open"])
-                    prev_cand = float(bar.get("prev_close", open_cand)) if hasattr(bar, "get") and pd.notnull(bar.get("prev_close")) else open_cand
-                    rise_cand = (open_cand / prev_cand - 1.0) if prev_cand > 0 else 0.0
-                    c_limit = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
-                    if c_limit > 0:
-                        is_ceiling_cand = (open_cand >= prev_cand * (1.0 + c_limit - 1e-4))
+                    cand_tradable = bar.get("open_tradable") if hasattr(bar, "get") else None
+                    if cand_tradable is False:
+                        continue
+                    elif cand_tradable is True:
+                        is_upper_circuit = False
                     else:
-                        is_std_up = any(abs(rise_cand - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
-                        is_ceiling_cand = is_std_up
+                        open_cand = float(bar["open"])
+                        prev_cand = float(bar.get("prev_close", open_cand)) if hasattr(bar, "get") and pd.notnull(bar.get("prev_close")) else open_cand
+                        rise_cand = (open_cand / prev_cand - 1.0) if prev_cand > 0 else 0.0
+                        c_limit = float(bar.get("circuit_limit_pct", 0.0)) if hasattr(bar, "get") else 0.0
+                        if c_limit > 0:
+                            is_ceiling_cand = (open_cand >= prev_cand * (1.0 + c_limit - 1e-4))
+                        else:
+                            is_std_up = any(abs(rise_cand - b_band) <= 0.0020 for b_band in (0.02, 0.05, 0.10, 0.20))
+                            is_ceiling_cand = is_std_up
+                        is_upper_circuit = is_ceiling_cand
 
-                    if bool(bar.get("is_upper_circuit", False) or is_ceiling_cand):
+                    if is_upper_circuit:
                         continue
 
                     # Sizing: Equal-Weight Slots (Zero Idle Cash) vs Risk Parity (Alpha Booster 1)
@@ -1060,18 +1067,16 @@ class UpgradedVCPBacktestEngine:
             nifty_end = 1.0
             nifty_cagr = 0.0
 
-        # Trade metrics: separate closed realized trades from still-open active terminal positions
+        # Trade metrics: strictly realized/closed trades only (active holdings kept separate)
         closed_trades_df = trades_df[trades_df["status"] != "Active"] if not trades_df.empty else pd.DataFrame()
         active_holdings_df = trades_df[trades_df["status"] == "Active"] if not trades_df.empty else pd.DataFrame()
-        total_trades = len(trades_df)
+        total_trades = len(closed_trades_df)
         realized_trade_count = len(closed_trades_df)
 
-        calc_df = closed_trades_df if realized_trade_count > 0 else trades_df
-        calc_total = len(calc_df)
-        winning_trades = calc_df[calc_df["net_return_pct"] > 0] if calc_total > 0 else pd.DataFrame()
-        losing_trades = calc_df[calc_df["net_return_pct"] <= 0] if calc_total > 0 else pd.DataFrame()
+        winning_trades = closed_trades_df[closed_trades_df["net_return_pct"] > 0] if total_trades > 0 else pd.DataFrame()
+        losing_trades = closed_trades_df[closed_trades_df["net_return_pct"] <= 0] if total_trades > 0 else pd.DataFrame()
 
-        win_rate = (len(winning_trades) / calc_total * 100.0) if calc_total > 0 else 0.0
+        win_rate = (len(winning_trades) / total_trades * 100.0) if total_trades > 0 else 0.0
         avg_gain = winning_trades["net_return_pct"].mean() if len(winning_trades) > 0 else 0.0
         avg_loss = abs(losing_trades["net_return_pct"].mean()) if len(losing_trades) > 0 else 0.0
         win_loss_ratio = (avg_gain / avg_loss) if avg_loss > 0 else 999.0
@@ -1085,8 +1090,8 @@ class UpgradedVCPBacktestEngine:
         loss_prob = 1.0 - win_prob
         expectancy = (win_prob * avg_gain) - (loss_prob * avg_loss)
 
-        avg_bars = calc_df["bars_held"].mean() if calc_total > 0 else 0.0
-        avg_days = calc_df["calendar_days"].mean() if calc_total > 0 else 0.0
+        avg_bars = closed_trades_df["bars_held"].mean() if total_trades > 0 else 0.0
+        avg_days = closed_trades_df["calendar_days"].mean() if total_trades > 0 else 0.0
 
         # Year-by-Year Table
         eq_df["year"] = eq_df["date"].dt.year

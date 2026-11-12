@@ -357,3 +357,145 @@ def test_nightly_missing_forward_bars_reports_awaiting_forward_bars():
     assert row["status"] == "AWAITING_FORWARD_BARS"
     assert row["days_held"] == 0
     assert row["current_price"] == 3000.0
+
+
+def test_corporate_action_settlement_rejects_bool():
+    """Settlement must explicitly reject bool (e.g. True/False) even though bool is an int subtype."""
+    import tempfile
+    from blumberg_market_radar.pipeline.live_portfolio import LivePortfolioManager
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mgr = LivePortfolioManager(state_path=Path(tmp_dir) / "state.json", initial_capital=1_000_000.0)
+        mgr.state.corporate_action_entitlements = [{
+            "parent_symbol": "VEDL",
+            "event_id": "SPINOFF_VEDL_2",
+            "allocated_capital": 50000.0,
+            "status": "Pending_Proceeds",
+            "shares": 100
+        }]
+        initial_cash = mgr.state.cash
+
+        with pytest.raises(ValueError, match="finite non-negative"):
+            mgr.settle_corporate_action_entitlement(event_id="SPINOFF_VEDL_2", realized_cash=True)
+        assert mgr.state.cash == initial_cash
+
+        with pytest.raises(ValueError, match="finite non-negative"):
+            mgr.settle_corporate_action_entitlement(event_id="SPINOFF_VEDL_2", realized_cash=False)
+        assert mgr.state.cash == initial_cash
+
+
+def test_state_schema_validation_fails_closed(tmp_path):
+    """Missing schema_version or missing required ledger keys must fail closed and preserve backup."""
+    import json
+    from blumberg_market_radar.pipeline.live_portfolio import LivePortfolioManager
+
+    state_file = tmp_path / "state.json"
+
+    # 1. Missing schema_version must raise ValueError and backup file
+    state_file.write_text(json.dumps({"cash": 1000000.0, "active_positions": {}, "closed_trades": []}), encoding="utf-8")
+    with pytest.raises((ValueError, RuntimeError), match="schema_version"):
+        LivePortfolioManager(state_path=state_file)
+    assert any(tmp_path.glob("state.json.corrupt*"))
+
+    # 2. Missing top-level ledger key must raise ValueError
+    bad_data = {
+        "schema_version": 1,
+        "initial_capital": 1000000.0,
+        "cash": 1000000.0,
+        "active_positions": {},
+        "closed_trades": [],
+    }
+    state_file.write_text(json.dumps(bad_data), encoding="utf-8")
+    with pytest.raises((ValueError, RuntimeError), match="missing required key"):
+        LivePortfolioManager(state_path=state_file)
+
+
+def test_live_tranche2_deferral_preserves_eligibility(tmp_path):
+    """When a stock is locked at upper circuit ceiling at open, Tranche 2 must defer and retain tranche2_eligible."""
+    mgr = LivePortfolioManager(state_path=tmp_path / "state.json", initial_capital=1_000_000.0)
+    mgr.state.active_positions["TATACHEM"] = {
+        "symbol": "TATACHEM",
+        "entry_date": "2026-01-01",
+        "shares": 100.0,
+        "invested_capital": 100000.0,
+        "entry_price": 1000.0,
+        "entry_price_with_friction": 1005.0,
+        "current_price": 1050.0,
+        "peak_price": 1050.0,
+        "current_gain_pct": 5.0,
+        "peak_gain_pct": 5.0,
+        "unrealized_pnl_rs": 5000.0,
+        "target_slot_capital": 125000.0,
+        "tranche1_shares": 100.0,
+        "tranche1_price": 1000.0,
+        "bars_held": 7,
+        "tranche2_eligible": True,
+        "tranche2_active": False,
+    }
+
+    # Day 8 open: locked limit-up at +5% ceiling (open 1102.5 vs prev_close 1050.0)
+    locked_bar = pd.DataFrame([{
+        "date": "2026-01-10", "symbol": "TATACHEM",
+        "open": 1102.5, "high": 1102.5, "low": 1102.5, "close": 1102.5, "volume": 100,
+        "prev_close": 1050.0, "circuit_limit_pct": 0.05
+    }])
+
+    res = mgr.execute_daily_rebalance(locked_bar, None, pd.DataFrame(), current_date_str="2026-01-10", enforce_regime=False)
+    pos = mgr.state.active_positions["TATACHEM"]
+    assert pos["tranche2_eligible"] is True
+    assert pos.get("tranche2_active", False) is False
+    assert any("TRANCHE 2 DEFERRED" in a for a in res["actions_taken"])
+
+
+def test_sector_guardrail_empty_candidates_returns_available_slots():
+    """apply_sector_cluster_guardrail must compute available_slots accurately even when candidates DataFrame is empty."""
+    active_df = pd.DataFrame([
+        {"symbol": "INFY", "sector": "IT", "status": "ACTIVE"},
+        {"symbol": "TCS", "sector": "IT", "status": "ACTIVE"},
+    ])
+    empty_cands = pd.DataFrame()
+
+    approved, counts, available = apply_sector_cluster_guardrail(
+        empty_cands, active_pipeline_df=active_df, max_stocks_per_sector=3, max_portfolio_slots=8
+    )
+    assert len(approved) == 0
+    assert counts.get("IT") == 2
+    assert available == 6  # 8 total - 2 active = 6 available slots!
+
+
+def test_nightly_tracking_excludes_same_day_bars_and_handles_missing_symbol():
+    """Nightly paper evaluation must not process same-day/past bars and must handle symbols with 0 bars."""
+    ledger = pd.DataFrame([
+        {
+            "signal_id": "SIG_MISSING",
+            "symbol": "ABSENT_SYM",
+            "signal_timestamp": "2026-06-01 15:30:00+00:00",
+            "price_at_signal": 500.0,
+            "radar_score": 90.0,
+            "primary_reason": "VCP Setup"
+        },
+        {
+            "signal_id": "SIG_SAME_DAY",
+            "symbol": "SAMEDAY_SYM",
+            "signal_timestamp": "2026-06-01 15:30:00+00:00",
+            "price_at_signal": 200.0,
+            "radar_score": 85.0,
+            "primary_reason": "Breakout"
+        }
+    ])
+
+    bars = pd.DataFrame([
+        {
+            "date": pd.to_datetime("2026-06-01 09:15:00", utc=True),
+            "symbol": "SAMEDAY_SYM",
+            "open": 200.0, "high": 205.0, "low": 198.0, "close": 200.0, "volume": 50000
+        }
+    ])
+
+    tracking, stats = evaluate_active_paper_signals(ledger, bars)
+    assert len(tracking) == 2
+    row_absent = tracking[tracking["symbol"] == "ABSENT_SYM"].iloc[0]
+    row_same = tracking[tracking["symbol"] == "SAMEDAY_SYM"].iloc[0]
+
+    assert row_absent["status"] == "AWAITING_FORWARD_BARS"
+    assert row_same["status"] == "AWAITING_FORWARD_BARS"

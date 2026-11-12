@@ -423,9 +423,6 @@ def apply_sector_cluster_guardrail(
     Returns:
         (approved_candidates_df, sector_counts_dict, available_slots)
     """
-    if ranked_candidates.empty:
-        return ranked_candidates, {}, max_portfolio_slots
-
     sector_counts: dict[str, int] = {}
     active_symbols: set[str] = set()
 
@@ -462,6 +459,10 @@ def apply_sector_cluster_guardrail(
 
     total_active = len(active_symbols)
     available_slots = max(0, max_portfolio_slots - total_active)
+
+    if ranked_candidates.empty:
+        return ranked_candidates, sector_counts, available_slots
+
     if available_slots <= 0:
         return pd.DataFrame(), sector_counts, 0
 
